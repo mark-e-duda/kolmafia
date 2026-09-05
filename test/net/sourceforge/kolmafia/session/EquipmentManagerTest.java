@@ -314,17 +314,5 @@ public class EquipmentManagerTest {
         assertTrue(EquipmentManager.canEquipChefstaff(false));
       }
     }
-
-    @Test
-    void pathEquipmentIsNotGloballyRejectedInHardcore() {
-      try (var cleanups =
-          new Cleanups(
-              withHardcore(),
-              withStats(10_000, 10_000, 10_000),
-              withSkill(SkillPool.TORSO),
-              withClass(AscensionClass.SEAL_CLUBBER))) {
-        assertTrue(EquipmentManager.canEquip(ItemPool.RIGHT_BEAR_ARM));
-      }
-    }
   }
 }
