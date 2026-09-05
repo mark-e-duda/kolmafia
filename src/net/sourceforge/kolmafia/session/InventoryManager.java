@@ -176,6 +176,13 @@ public abstract class InventoryManager {
     return count > 0 && count >= item.getCount();
   }
 
+  public static int getGarbageTote() {
+    return KoLCharacter.inLegacyOfLoathing()
+            && InventoryManager.hasItem(ItemPool.REPLICA_GARBAGE_TOTE)
+        ? ItemPool.REPLICA_GARBAGE_TOTE
+        : ItemPool.GARBAGE_TOTE;
+  }
+
   public static final int getAccessibleCount(final int itemId) {
     return getAccessibleCount(itemId, true);
   }
@@ -184,12 +191,25 @@ public abstract class InventoryManager {
     return InventoryManager.getAccessibleCount(ItemPool.get(itemId, 1), includeStash);
   }
 
+  public static final int getAccessibleCount(
+      final int itemId, final boolean includeStash, final boolean ignoreStandardRestriction) {
+    return InventoryManager.getAccessibleCount(
+        ItemPool.get(itemId, 1), includeStash, ignoreStandardRestriction);
+  }
+
   public static final int getAccessibleCount(final AdventureResult item) {
     return getAccessibleCount(item, true);
   }
 
   public static final int getAccessibleCount(
       final AdventureResult item, final boolean includeStash) {
+    return getAccessibleCount(item, includeStash, false);
+  }
+
+  public static final int getAccessibleCount(
+      final AdventureResult item,
+      final boolean includeStash,
+      final boolean ignoreStandardRestriction) {
     if (item == null) {
       return 0;
     }
@@ -206,7 +226,7 @@ public abstract class InventoryManager {
     }
 
     // If this item is restricted, ignore it entirely.
-    if (!ItemDatabase.isAllowed(item)) {
+    if (!ignoreStandardRestriction && !ItemDatabase.isAllowed(item)) {
       return 0;
     }
 
@@ -218,11 +238,7 @@ public abstract class InventoryManager {
       count += item.getCount(KoLConstants.closet);
     }
 
-    if ((!KoLCharacter.inLegacyOfLoathing() || pullableInLoL(itemId))
-        && (!KoLCharacter.inSeaPath() || pullableInSeaPath(itemId))
-        && (!KoLCharacter.isThrifty()
-            || ThriftyRequest.isAllowed(
-                RestrictedItemType.ITEMS, ItemDatabase.getItemName(itemId)))) {
+    if (InventoryManager.pullableInCurrentPath(itemId)) {
       // Free Pulls from Hagnk's are always accessible
       count += item.getCount(KoLConstants.freepulls);
 
@@ -2182,6 +2198,14 @@ public abstract class InventoryManager {
               itemId, EnumSet.of(Attribute.COMBAT, Attribute.COMBAT_REUSABLE));
       default -> false;
     };
+  }
+
+  public static boolean pullableInCurrentPath(int itemId) {
+    return (!KoLCharacter.inLegacyOfLoathing() || pullableInLoL(itemId))
+        && (!KoLCharacter.inSeaPath() || pullableInSeaPath(itemId))
+        && (!KoLCharacter.isThrifty()
+            || ThriftyRequest.isAllowed(
+                RestrictedItemType.ITEMS, ItemDatabase.getItemName(itemId)));
   }
 
   public static boolean pullableInSeaPath(int itemId) {

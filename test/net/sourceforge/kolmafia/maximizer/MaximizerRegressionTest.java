@@ -6,6 +6,8 @@ import static internal.helpers.Player.withEnthroned;
 import static internal.helpers.Player.withEquippableItem;
 import static internal.helpers.Player.withEquipped;
 import static internal.helpers.Player.withFamiliarInTerrarium;
+import static internal.helpers.Player.withOverrideModifiers;
+import static internal.helpers.Player.withPath;
 import static internal.helpers.Player.withSign;
 import static internal.helpers.Player.withStats;
 import static internal.matchers.Maximizer.recommendsSlot;
@@ -19,12 +21,16 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import internal.helpers.Cleanups;
+import java.util.Set;
+import net.sourceforge.kolmafia.AscensionPath.Path;
 import net.sourceforge.kolmafia.FamiliarData;
 import net.sourceforge.kolmafia.KoLCharacter;
+import net.sourceforge.kolmafia.ModifierType;
 import net.sourceforge.kolmafia.equipment.Slot;
 import net.sourceforge.kolmafia.modifiers.DerivedModifier;
 import net.sourceforge.kolmafia.modifiers.DoubleModifier;
 import net.sourceforge.kolmafia.objectpool.FamiliarPool;
+import net.sourceforge.kolmafia.objectpool.ItemPool;
 import net.sourceforge.kolmafia.session.EquipmentManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -117,6 +123,21 @@ public class MaximizerRegressionTest {
       assertEquals(0, modFor(DerivedModifier.BUFFED_MUS), 0.01);
       // Actually equipped the buddy bjorn
       assertEquals(25, modFor(DoubleModifier.MEATDROP), 0.01);
+    }
+  }
+
+  @Test
+  public void doesNotCarryFamiliarsOnPathsWithoutFamiliars() {
+    var cleanups =
+        new Cleanups(
+            withPath(Path.ACTUALLY_ED_THE_UNDYING),
+            withEquippableItem("Crown of Thrones"),
+            withFamiliarInTerrarium(FamiliarPool.DICE),
+            withOverrideModifiers(ModifierType.THRONE, "Fuzzy Dice", "Muscle: +100"));
+
+    try (cleanups) {
+      assertTrue(maximize("mus"));
+      assertThat(Maximizer.best.getEnthroned(), equalTo(FamiliarData.NO_FAMILIAR));
     }
   }
 
@@ -216,6 +237,29 @@ public class MaximizerRegressionTest {
     }
   }
 
+  @Test
+  public void keepsBothCarriersEquippedWhileTryingFamiliars() {
+    var cleanups =
+        new Cleanups(
+            withEquippableItem("Crown of Thrones"),
+            withEquippableItem("Buddy Bjorn"),
+            withFamiliarInTerrarium(FamiliarPool.DICE),
+            withFamiliarInTerrarium(FamiliarPool.LOBSTER),
+            withOverrideModifiers(ModifierType.THRONE, "Fuzzy Dice", "Muscle: +100"),
+            withOverrideModifiers(ModifierType.THRONE, "Rock Lobster", "Muscle: +50"));
+
+    try (cleanups) {
+      assertTrue(maximize("mus, +25 bonus Buddy Bjorn, +25 bonus Crown of Thrones, -tie"));
+
+      assertThat(
+          Maximizer.best.equipment.get(Slot.CONTAINER).getItemId(), equalTo(ItemPool.BUDDY_BJORN));
+      assertThat(Maximizer.best.equipment.get(Slot.HAT).getItemId(), equalTo(ItemPool.HATSEAT));
+      assertThat(
+          Set.of(Maximizer.best.getBjorned().getId(), Maximizer.best.getEnthroned().getId()),
+          equalTo(Set.of(FamiliarPool.DICE, FamiliarPool.LOBSTER)));
+    }
+  }
+
   // https://kolmafia.us/threads/27073/
   @Test
   public void noTiePrefersCurrentGear() {
@@ -225,7 +269,7 @@ public class MaximizerRegressionTest {
             withEquippableItem("Camp Scout backpack"),
             // +1 mys, +2 mox; 7 mox required; Maximizer needs to recommend changes in order to
             // create a
-            // speculation.
+            // loadout.
             withEquippableItem("basic meat fez"),
             // +7 mus; 75 mys required
             withEquipped(Slot.CONTAINER, "barskin cloak"));

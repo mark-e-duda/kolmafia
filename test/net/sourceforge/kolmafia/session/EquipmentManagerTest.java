@@ -4,12 +4,15 @@ import static internal.helpers.Equipment.assertItem;
 import static internal.helpers.Equipment.assertItemUnequip;
 import static internal.helpers.Networking.html;
 import static internal.helpers.Networking.json;
+import static internal.helpers.Player.withClass;
 import static internal.helpers.Player.withEquipped;
 import static internal.helpers.Player.withFamiliar;
+import static internal.helpers.Player.withHardcore;
 import static internal.helpers.Player.withIntrinsicEffect;
 import static internal.helpers.Player.withItem;
 import static internal.helpers.Player.withPath;
 import static internal.helpers.Player.withProperty;
+import static internal.helpers.Player.withSkill;
 import static internal.helpers.Player.withStats;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
@@ -20,6 +23,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import com.alibaba.fastjson2.JSONObject;
 import internal.helpers.Cleanups;
 import net.sourceforge.kolmafia.AdventureResult;
+import net.sourceforge.kolmafia.AscensionClass;
 import net.sourceforge.kolmafia.AscensionPath;
 import net.sourceforge.kolmafia.AscensionPath.Path;
 import net.sourceforge.kolmafia.KoLCharacter;
@@ -288,6 +292,27 @@ public class EquipmentManagerTest {
       assertItemUnequip(Slot.CODPIECE3);
       assertItemUnequip(Slot.CODPIECE4);
       assertItemUnequip(Slot.CODPIECE5);
+    }
+  }
+
+  @Nested
+  class EquipmentRules {
+    @Test
+    void chefstaffEquipmentUsesSharedClassRules() {
+      try (var cleanups = withClass(AscensionClass.SAUCEROR)) {
+        assertFalse(EquipmentManager.canEquipChefstaff(false));
+        assertTrue(EquipmentManager.canEquipChefstaff(true));
+      }
+      try (var cleanups =
+          new Cleanups(
+              withPath(Path.AVATAR_OF_JARLSBERG), withClass(AscensionClass.AVATAR_OF_JARLSBERG))) {
+        assertTrue(EquipmentManager.canEquipChefstaff(false));
+      }
+      try (var cleanups =
+          new Cleanups(
+              withClass(AscensionClass.SEAL_CLUBBER), withSkill(SkillPool.SPIRIT_OF_RIGATONI))) {
+        assertTrue(EquipmentManager.canEquipChefstaff(false));
+      }
     }
   }
 }

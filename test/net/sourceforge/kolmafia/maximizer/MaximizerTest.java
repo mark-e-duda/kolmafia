@@ -27,6 +27,7 @@ import static internal.helpers.Player.withOverrideModifiers;
 import static internal.helpers.Player.withPath;
 import static internal.helpers.Player.withProperty;
 import static internal.helpers.Player.withRestricted;
+import static internal.helpers.Player.withRonin;
 import static internal.helpers.Player.withSign;
 import static internal.helpers.Player.withSkill;
 import static internal.helpers.Player.withStats;
@@ -36,6 +37,7 @@ import static internal.matchers.Maximizer.recommendsSlot;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.hasProperty;
 import static org.hamcrest.Matchers.hasToString;
@@ -46,8 +48,12 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import internal.extensions.LegacyBehavior;
 import internal.helpers.Cleanups;
 import java.time.Month;
+import java.util.EnumSet;
+import java.util.List;
+import java.util.Map;
 import net.sourceforge.kolmafia.AscensionClass;
 import net.sourceforge.kolmafia.AscensionPath.Path;
 import net.sourceforge.kolmafia.KoLCharacter;
@@ -77,6 +83,27 @@ import org.junit.jupiter.params.provider.CsvSource;
 
 public class MaximizerTest {
   @Test
+  void reportsWhetherTheLastLoadoutSucceeded() {
+    var previousBest = Maximizer.best;
+    var previousEvaluator = Maximizer.eval;
+    try {
+      Maximizer.best = null;
+      assertThat(Maximizer.lastMaximizeSucceeded(), is(false));
+
+      Maximizer.eval = new Evaluator("0, -tie");
+      Maximizer.best = new MaximizerLoadout();
+      Maximizer.best.getScore();
+      assertThat(Maximizer.lastMaximizeSucceeded(), is(true));
+
+      Maximizer.best.markFailed();
+      assertThat(Maximizer.lastMaximizeSucceeded(), is(false));
+    } finally {
+      Maximizer.best = previousBest;
+      Maximizer.eval = previousEvaluator;
+    }
+  }
+
+  @Test
   void respectsCachedCombinationLimit() {
     try (var cleanups =
         new Cleanups(
@@ -86,6 +113,11 @@ public class MaximizerTest {
       maximize("item drop");
       assertThat(Maximizer.bestChecked, is(1));
       assertThat(Maximizer.combinationLimit, is(1L));
+      assertThat(Maximizer.lastSearchMetrics().combinationsChecked(), is(1));
+      assertTrue(Maximizer.lastSearchMetrics().catalogCandidates() > 0);
+      assertTrue(Maximizer.lastSearchMetrics().shortlistedCandidates() > 0);
+      assertTrue(Maximizer.lastSearchMetrics().scoreCalculations() > 0);
+      assertTrue(Maximizer.lastSearchMetrics().searchNodes() > 0);
     }
 
     try (var cleanups =
@@ -99,31 +131,130 @@ public class MaximizerTest {
   }
 
   @Test
-  void invalidatesCachedTieComparisons() {
-    Maximizer.eval = new Evaluator("0, -tie");
-    var speculation = new MaximizerSpeculation();
-    var comparison = new MaximizerSpeculation();
+  void catalogRetainsCandidatesRejectedByIsolatedScoring() {
+    try (var cleanups =
+        new Cleanups(
+            withEquippableItem("helmet turtle"),
+            withOverrideModifiers(ModifierType.ITEM, ItemPool.HELMET_TURTLE, "Item Drop: -100"))) {
+      maximize("item drop");
 
-    speculation.equip(Slot.HAT, ItemPool.get(ItemPool.ANTIQUE_HELMET));
-    speculation.setUnscored();
-    speculation.getTiebreaker();
-
-    var helmetTurtle = ItemPool.get(ItemPool.HELMET_TURTLE);
-    speculation.equip(Slot.HAT, helmetTurtle);
-    speculation.setUnscored();
-    comparison.equip(Slot.HAT, helmetTurtle);
-    comparison.setUnscored();
-
-    assertThat(speculation.compareTo(comparison), is(0));
+      assertTrue(
+          Maximizer.lastSearchMetrics().catalogCandidates()
+              > Maximizer.lastSearchMetrics().shortlistedCandidates());
+    }
   }
 
   @Test
-  void clonedSpeculationOwnsCalculatedModifiers() {
-    var speculation = new MaximizerSpeculation();
-    double itemDrop = speculation.calculate().getDouble(DoubleModifier.ITEMDROP);
-    var copy = speculation.clone();
+  void exhaustiveCatalogSearchPreservesTheLegacyFloor() {
+    try (var cleanups =
+        new Cleanups(
+            withEquippableItem("helmet turtle"),
+            withEquippableItem(ItemPool.DESIGNER_SWEATPANTS),
+            withOverrideModifiers(
+                ModifierType.ITEM, ItemPool.HELMET_TURTLE, "Surgeonosity: +1, Item Drop: -1"),
+            withOverrideModifiers(
+                ModifierType.ITEM, ItemPool.DESIGNER_SWEATPANTS, "Surgeonosity: +1, Item Drop: -1"),
+            withProperty("maximizerCombinationLimit", 0))) {
+      var filter = EnumSet.of(KoLConstants.filterType.EQUIP);
+      Maximizer.maximize(
+          "item drop, 2 surgeonosity min, -tie",
+          EquipScope.SPECULATE_INVENTORY,
+          0,
+          PriceLevel.DONT_CHECK,
+          false,
+          filter);
+      var legacyQuality = Maximizer.best().quality();
 
-    speculation.getModifiers().setDouble(DoubleModifier.ITEMDROP, itemDrop + 1);
+      Maximizer.maximizeExhaustively(
+          "item drop, 2 surgeonosity min, -tie",
+          EquipScope.SPECULATE_INVENTORY,
+          0,
+          PriceLevel.DONT_CHECK,
+          false,
+          filter);
+      assertThat(Maximizer.best().quality(), greaterThanOrEqualTo(legacyQuality));
+      assertThat(Maximizer.best().quality(), greaterThanOrEqualTo(legacyQuality));
+    }
+  }
+
+  @Test
+  void resetsSearchStateForRunsWithoutEquipmentSearch() {
+    try (var cleanups =
+        new Cleanups(
+            withEquippableItem("hardened slime hat"),
+            withEquippableItem("bounty-hunting helmet"),
+            withEquippableItem(ItemPool.JURASSIC_PARKA),
+            withSkill(SkillPool.TORSO),
+            withProperty("maximizerCombinationLimit", 1))) {
+      maximize("item drop");
+      assertThat(Maximizer.bestChecked, is(1));
+
+      assertFalse(maximize("ml, equip Jurassic Parka (magical mode)"));
+      assertThat(Maximizer.bestChecked, is(0));
+      assertThat(Maximizer.lastSearchMetrics(), is(SearchMetrics.EMPTY));
+
+      Maximizer.maximize(
+          "item drop",
+          EquipScope.SPECULATE_INVENTORY,
+          0,
+          PriceLevel.DONT_CHECK,
+          false,
+          EnumSet.of(KoLConstants.filterType.CAST));
+
+      assertThat(Maximizer.bestChecked, is(0));
+      assertThat(Maximizer.lastSearchMetrics(), is(SearchMetrics.EMPTY));
+
+      Maximizer.maximize(
+          "item drop",
+          EquipScope.SPECULATE_INVENTORY,
+          0,
+          PriceLevel.DONT_CHECK,
+          false,
+          EnumSet.noneOf(KoLConstants.filterType.class));
+
+      assertThat(Maximizer.bestChecked, is(0));
+      assertThat(Maximizer.lastSearchMetrics(), is(SearchMetrics.EMPTY));
+    }
+  }
+
+  @Test
+  void invalidatesCachedTieComparisons() {
+    Maximizer.eval = new Evaluator("0, -tie");
+    var loadout = new MaximizerLoadout();
+    var comparison = new MaximizerLoadout();
+
+    loadout.equip(Slot.HAT, ItemPool.get(ItemPool.ANTIQUE_HELMET));
+    loadout.setUnscored();
+    loadout.getTiebreaker();
+
+    var helmetTurtle = ItemPool.get(ItemPool.HELMET_TURTLE);
+    loadout.equip(Slot.HAT, helmetTurtle);
+    loadout.setUnscored();
+    comparison.equip(Slot.HAT, helmetTurtle);
+    comparison.setUnscored();
+
+    assertThat(loadout.compareTo(comparison), is(0));
+  }
+
+  @Test
+  void evaluationReportsFailureWithoutCompatibilityScoring() {
+    var evaluator = new Evaluator("0 da, 2 min, -tie");
+    var modifiers = new Modifiers();
+    modifiers.setDouble(DoubleModifier.DAMAGE_ABSORPTION, 1.0);
+
+    var outcome = evaluator.evaluate(modifiers, Map.of(), Map.of());
+
+    assertTrue(outcome.failed());
+    assertThat(evaluator.getScore(modifiers), is(outcome.score()));
+  }
+
+  @Test
+  void clonedLoadoutOwnsCalculatedModifiers() {
+    var loadout = new MaximizerLoadout();
+    double itemDrop = loadout.calculate().getDouble(DoubleModifier.ITEMDROP);
+    var copy = loadout.clone();
+
+    loadout.getModifiers().setDouble(DoubleModifier.ITEMDROP, itemDrop + 1);
 
     assertThat(copy.getModifiers().getDouble(DoubleModifier.ITEMDROP), equalTo(itemDrop));
   }
@@ -153,6 +284,64 @@ public class MaximizerTest {
       assertTrue(maximize("mus"));
       assertEquals(1, modFor(DerivedModifier.BUFFED_MUS), 0.01);
       assertThat(getBoosts(), hasItem(recommendsSlot(Slot.HAT, "helmet turtle")));
+    }
+  }
+
+  @Test
+  void onlySuggestsHardcorePathEquipmentOnItsPath() {
+    record PathItem(int itemId, AscensionClass ascensionClass, Path path) {}
+    var pathItems =
+        List.of(
+            new PathItem(ItemPool.BORIS_HELM, AscensionClass.AVATAR_OF_BORIS, Path.AVATAR_OF_BORIS),
+            new PathItem(
+                ItemPool.BORIS_HELM_ASKEW, AscensionClass.AVATAR_OF_BORIS, Path.AVATAR_OF_BORIS),
+            new PathItem(ItemPool.RIGHT_BEAR_ARM, AscensionClass.ZOMBIE_MASTER, Path.ZOMBIE_SLAYER),
+            new PathItem(ItemPool.LEFT_BEAR_ARM, AscensionClass.ZOMBIE_MASTER, Path.ZOMBIE_SLAYER),
+            new PathItem(
+                ItemPool.JARLS_PAN, AscensionClass.AVATAR_OF_JARLSBERG, Path.AVATAR_OF_JARLSBERG),
+            new PathItem(
+                ItemPool.JARLS_COSMIC_PAN,
+                AscensionClass.AVATAR_OF_JARLSBERG,
+                Path.AVATAR_OF_JARLSBERG),
+            new PathItem(ItemPool.FOLDER_HOLDER, AscensionClass.SEAL_CLUBBER, Path.KOLHS),
+            new PathItem(
+                ItemPool.PETE_JACKET,
+                AscensionClass.AVATAR_OF_SNEAKY_PETE,
+                Path.AVATAR_OF_SNEAKY_PETE),
+            new PathItem(
+                ItemPool.PETE_JACKET_COLLAR,
+                AscensionClass.AVATAR_OF_SNEAKY_PETE,
+                Path.AVATAR_OF_SNEAKY_PETE),
+            new PathItem(ItemPool.THORS_PLIERS, AscensionClass.SEAL_CLUBBER, Path.HEAVY_RAINS),
+            new PathItem(ItemPool.CROWN_OF_ED, AscensionClass.ED, Path.ACTUALLY_ED_THE_UNDYING));
+
+    for (var item : pathItems) {
+      try (var cleanups =
+          new Cleanups(
+              withHardcore(),
+              withStats(10_000, 10_000, 10_000),
+              withSkill(SkillPool.TORSO),
+              withClass(AscensionClass.SEAL_CLUBBER),
+              withEquippableItem(item.itemId()),
+              withOverrideModifiers(
+                  ModifierType.ITEM, item.itemId(), "Muscle: +100, Mysticality: +100"))) {
+        assertTrue(maximize("mus, mys, -tie"));
+        assertThat(getBoosts(), not(hasItem(recommends(item.itemId()))));
+      }
+
+      try (var cleanups =
+          new Cleanups(
+              withHardcore(),
+              withStats(10_000, 10_000, 10_000),
+              withPath(item.path()),
+              withSkill(SkillPool.TORSO),
+              withClass(item.ascensionClass()),
+              withEquippableItem(item.itemId()),
+              withOverrideModifiers(
+                  ModifierType.ITEM, item.itemId(), "Muscle: +100, Mysticality: +100"))) {
+        assertTrue(maximize("mus, mys, -tie"));
+        assertThat(getBoosts(), hasItem(recommends(item.itemId())));
+      }
     }
   }
 
@@ -293,12 +482,10 @@ public class MaximizerTest {
       Modifiers modifiers = new Modifiers();
 
       modifiers.setDouble(DoubleModifier.DAMAGE_ABSORPTION, 1.0);
-      evaluator.getScore(modifiers);
-      assertTrue(evaluator.failed);
+      assertTrue(evaluator.evaluate(modifiers).failed());
 
       modifiers.setDouble(DoubleModifier.DAMAGE_ABSORPTION, 2.0);
-      evaluator.getScore(modifiers);
-      assertFalse(evaluator.failed);
+      assertFalse(evaluator.evaluate(modifiers).failed());
     }
   }
 
@@ -503,11 +690,31 @@ public class MaximizerTest {
     }
 
     @Test
-    public void surgeonosityItemsDontStack() {
+    @LegacyBehavior(
+        "bare surgeonosity always requires five pieces; a correct maximizer would require only "
+            + "the four slots available to a character without Torso Awareness")
+    public void defaultSurgeonosityRetainsLegacyFiveItemTarget() {
+      final var cleanups =
+          new Cleanups(
+              withEquippableItem("head mirror"),
+              withEquippableItem("bloodied surgical dungarees"),
+              withEquippableItem("surgical apron"),
+              withEquippableItem("surgical mask"),
+              withEquippableItem("half-size scalpel"));
+
+      try (cleanups) {
+        assertFalse(maximize("surgeonosity, -tie"));
+        assertEquals(4, modFor(BitmapModifier.SURGEONOSITY), 0.01);
+        assertThat(getBoosts(), not(hasItem(recommendsSlot(Slot.SHIRT, "surgical apron"))));
+      }
+    }
+
+    @Test
+    public void explicitSurgeonosityTargetIsRequiredAndItemsDontStack() {
       var cleanups = withEquippableItem("surgical mask", 3);
 
       try (cleanups) {
-        maximize("surgeonosity, -tie");
+        assertFalse(maximize("2 surgeonosity, -tie"));
         assertEquals(1, modFor(BitmapModifier.SURGEONOSITY), 0.01);
         assertThat(
             getBoosts().stream()
@@ -771,6 +978,24 @@ public class MaximizerTest {
         assertThat(getBoosts(), not(hasItem(recommendsSlot(Slot.HAT))));
         assertThat(
             getBoosts(), hasItem(hasProperty("cmd", startsWith("absorb ¶3")))); // helmet turtle
+      }
+    }
+
+    @Test
+    public void absorbablePullIsNotShadowedByAFoldableSibling() {
+      final var cleanups =
+          new Cleanups(
+              withPath(Path.GELATINOUS_NOOB),
+              withHardcore(false),
+              withRonin(true),
+              withInteractivity(false),
+              withProperty("maximizerFoldables", true),
+              withItem("makeshift skirt"),
+              withItemInStorage("makeshift cape"));
+
+      try (cleanups) {
+        maximizeAny("item");
+        assertThat(getBoosts(), hasItem(hasProperty("cmd", startsWith("pull ¶2080;absorb ¶2080"))));
       }
     }
 
@@ -1751,6 +1976,9 @@ public class MaximizerTest {
     }
 
     @Test
+    @LegacyBehavior(
+        "sea forces the Crown of Ed into fish mode before equipment search; a correct maximizer "
+            + "would keep the requested hyena mode and use the available SCUBA tank")
     public void shouldErrorWhenIndirectConflict2() {
       final var cleanups =
           new Cleanups(
@@ -1794,6 +2022,17 @@ public class MaximizerTest {
       try (cleanups) {
         assertTrue(maximize("meat, -acc1"));
         assertThat(getBoosts(), not(hasItem(hasProperty("cmd", startsWith("backupcamera")))));
+      }
+    }
+
+    @Test
+    public void forbiddenItemInExcludedSlotIsLeftEquipped() {
+      final var cleanups = new Cleanups(withEquipped(Slot.WEAPON, ItemPool.BROKEN_CHAMPAGNE));
+
+      try (cleanups) {
+        assertTrue(maximize("-equip broken champagne bottle -weapon"));
+        assertThat(
+            Maximizer.best().equipment.get(Slot.WEAPON).getItemId(), is(ItemPool.BROKEN_CHAMPAGNE));
       }
     }
 
@@ -1994,6 +2233,9 @@ public class MaximizerTest {
     }
 
     @Test
+    @LegacyBehavior(
+        "sea forces the Crown of Ed into fish mode before equipment search; a correct maximizer "
+            + "would use the available SCUBA tank and take the higher-scoring hyena bonus")
     public void bonusModeNeverOverridesImplicitForce() {
       final var cleanups =
           new Cleanups(
@@ -2963,7 +3205,7 @@ public class MaximizerTest {
 
       try (cleanups) {
         maximizeAny("+equip card sleeve, Weapon Damage");
-        assertFalse(Maximizer.best.failed);
+        assertFalse(Maximizer.best.failed());
         assertThat(getBoosts(), hasItem(recommends(ItemPool.CARD_SLEEVE)));
         assertThat(getBoosts(), hasItem(recommendsSlot(Slot.CARDSLEEVE)));
       }
@@ -2982,7 +3224,7 @@ public class MaximizerTest {
 
       try (cleanups) {
         maximizeAny("+equip over-the-shoulder folder holder, muscle");
-        assertFalse(Maximizer.best.failed);
+        assertFalse(Maximizer.best.failed());
         assertThat(getBoosts(), hasItem(recommends(ItemPool.FOLDER_HOLDER)));
         assertThat(getBoosts(), not(hasItem(recommendsSlot(Slot.FOLDER1))));
       }
@@ -3002,7 +3244,7 @@ public class MaximizerTest {
 
       try (cleanups) {
         maximizeAny("+equip scratch 'n' sniff sword, muscle");
-        assertFalse(Maximizer.best.failed);
+        assertFalse(Maximizer.best.failed());
         assertThat(getBoosts(), hasItem(recommends(ItemPool.STICKER_SWORD)));
         assertThat(getBoosts(), not(hasItem(recommendsSlot(Slot.STICKER1))));
       }
@@ -3023,7 +3265,7 @@ public class MaximizerTest {
 
       try (cleanups) {
         maximizeAny("+equip your cowboy boots, muscle");
-        assertFalse(Maximizer.best.failed);
+        assertFalse(Maximizer.best.failed());
         assertThat(getBoosts(), hasItem(recommends(ItemPool.COWBOY_BOOTS)));
         assertThat(getBoosts(), not(hasItem(recommendsSlot(Slot.BOOTSKIN))));
         assertThat(getBoosts(), not(hasItem(recommendsSlot(Slot.BOOTSPUR))));
@@ -3331,6 +3573,19 @@ public class MaximizerTest {
     }
 
     @Test
+    public void doesNotRecommendPawableEffectsWithoutPaw() {
+      var cleanups = new Cleanups(withItem(ItemPool.POCKET_WISH));
+
+      try (cleanups) {
+        maximize("-combat");
+        var boosts = getBoosts();
+        assertThat(boosts, hasItem(hasProperty("cmd", startsWith("genie effect Disquiet Riot"))));
+        assertThat(
+            boosts, not(hasItem(hasProperty("cmd", startsWith("monkeypaw effect Disquiet Riot")))));
+      }
+    }
+
+    @Test
     public void acquiresWishIfItIsMallBuyable() {
       var cleanups =
           new Cleanups(withProperty("autoSatisfyWithMall", true), withInteractivity(true));
@@ -3526,5 +3781,30 @@ public class MaximizerTest {
         assertThat(modFor(DoubleModifier.DAMAGE_REDUCTION), equalTo(9.0));
       }
     }
+  }
+
+  @Test
+  void searchDeadlineIsOptInByDefault() {
+    assertThat(Preferences.getInteger("maximizerSearchTimeLimit"), is(0));
+  }
+
+  @Test
+  void marksExpiredSearchIncomplete() {
+    var session = new MaximizerSession(new MaximizerLoadout(), 0);
+    session.searchDeadlineNanos = 0;
+
+    assertFalse(session.keepSearching());
+    assertFalse(session.searchComplete);
+  }
+
+  @Test
+  void recordsCandidateCompilationBeforeSearchStarts() {
+    var session = new MaximizerSession(new MaximizerLoadout(), 0);
+    session.candidateCompilationStartedNanos = System.nanoTime() - 1_000_000;
+
+    session.finishCandidateCompilation();
+
+    assertTrue(session.candidateCompilationNanos >= 1_000_000);
+    assertThat(session.candidateCompilationStartedNanos, is(0L));
   }
 }
