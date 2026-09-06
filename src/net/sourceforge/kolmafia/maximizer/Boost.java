@@ -7,6 +7,12 @@ import net.sourceforge.kolmafia.KoLmafiaCLI;
 import net.sourceforge.kolmafia.Modeable;
 import net.sourceforge.kolmafia.equipment.Slot;
 
+/**
+ * One displayable and optionally executable recommendation produced by the Maximizer.
+ *
+ * <p>A boost retains both presentation text and the CLI command needed to apply the change, plus
+ * the affected item, effect, familiar, or mode state exposed through scripting and the GUI.
+ */
 public class Boost implements Comparable<Boost> {
   private boolean isEquipment, isShrug, priority;
   private final String cmd;
@@ -106,31 +112,31 @@ public class Boost implements Comparable<Boost> {
     return true;
   }
 
-  public void addTo(MaximizerSpeculation spec) {
+  public void addTo(MaximizerLoadout loadout) {
     if (this.isEquipment) {
       if (this.fam != null) {
-        spec.setFamiliar(fam);
+        loadout.setFamiliar(fam);
       } else if (this.slot != Slot.NONE && this.item != null) {
-        spec.equip(slot, this.item);
+        loadout.equip(slot, this.item);
         if (this.enthroned != null) {
-          spec.setEnthroned(this.enthroned);
+          loadout.setEnthroned(this.enthroned);
         }
         if (this.bjorned != null) {
-          spec.setBjorned(this.bjorned);
+          loadout.setBjorned(this.bjorned);
         }
         this.modeables.forEach(
             (k, v) -> {
-              if (v != null) spec.setModeable(k, v);
+              if (v != null) loadout.setModeable(k, v);
             });
       }
     } else if (this.effect != null) {
       if (this.isShrug) {
-        spec.removeEffect(this.effect);
+        loadout.removeEffect(this.effect);
       } else {
-        spec.addEffect(this.effect);
+        loadout.addEffect(this.effect);
       }
     } else if (this.horse != null) {
-      spec.setHorsery(this.horse);
+      loadout.setHorsery(this.horse);
     }
   }
 

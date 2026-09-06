@@ -20,19 +20,16 @@ import net.sourceforge.kolmafia.KoLConstants.ConsumptionType;
 import net.sourceforge.kolmafia.KoLConstants.MafiaState;
 import net.sourceforge.kolmafia.KoLmafia;
 import net.sourceforge.kolmafia.KoLmafiaCLI;
-import net.sourceforge.kolmafia.ModifierType;
 import net.sourceforge.kolmafia.RequestLogger;
 import net.sourceforge.kolmafia.RequestThread;
 import net.sourceforge.kolmafia.SpecialOutfit;
 import net.sourceforge.kolmafia.equipment.Slot;
 import net.sourceforge.kolmafia.equipment.SlotSet;
 import net.sourceforge.kolmafia.objectpool.ItemPool;
-import net.sourceforge.kolmafia.objectpool.SkillPool;
 import net.sourceforge.kolmafia.persistence.ConcoctionDatabase;
 import net.sourceforge.kolmafia.persistence.DebugDatabase;
 import net.sourceforge.kolmafia.persistence.EquipmentDatabase;
 import net.sourceforge.kolmafia.persistence.ItemDatabase;
-import net.sourceforge.kolmafia.persistence.ModifierDatabase;
 import net.sourceforge.kolmafia.preferences.Preferences;
 import net.sourceforge.kolmafia.session.EquipmentManager;
 import net.sourceforge.kolmafia.session.InventoryManager;
@@ -681,7 +678,7 @@ public class EquipmentRequest extends PasswordHashRequest {
       case SIXGUN -> Slot.HOLSTER;
       default -> {
         // if it's a gem not equippable elsewhere, assume codpiece
-        if (isCodpieceGem(itemId)) {
+        if (EquipmentDatabase.isCodpieceGem(itemId)) {
           yield EquipmentRequest.availableCodpiece();
         }
         yield Slot.NONE;
@@ -988,7 +985,7 @@ public class EquipmentRequest extends PasswordHashRequest {
         int itemId = EquipmentRequest.decodeUnsignedVarInt(buffer);
         if (itemId <= 0) {
           configuration.add(EquipmentRequest.UNEQUIP);
-        } else if (EquipmentRequest.isCodpieceGem(itemId)) {
+        } else if (EquipmentDatabase.isCodpieceGem(itemId)) {
           configuration.add(ItemPool.get(itemId));
         } else {
           RequestLogger.printLine(
@@ -1212,8 +1209,7 @@ public class EquipmentRequest extends PasswordHashRequest {
 
     // If we remove Special Sauce Glove, also remove Chefstaff
     if (oldItemId == ItemPool.SPECIAL_SAUCE_GLOVE
-        && !KoLCharacter.hasSkill(SkillPool.SPIRIT_OF_RIGATONI)
-        && !KoLCharacter.isJarlsberg()
+        && !EquipmentManager.canEquipChefstaff(false)
         && EquipmentManager.usingChefstaff()) {
       EquipmentManager.removeEquipment(EquipmentManager.getEquipment(Slot.WEAPON), Slot.WEAPON);
     }
@@ -2348,10 +2344,5 @@ public class EquipmentRequest extends PasswordHashRequest {
 
     // Have to get it from the Equipment page of the Inventory
     RequestThread.postRequest(new EquipmentRequest(EquipmentRequestType.EQUIPMENT));
-  }
-
-  public static boolean isCodpieceGem(int itemId) {
-    var codpieceMods = ModifierDatabase.getModifiers(ModifierType.ETERNITY_CODPIECE, itemId);
-    return codpieceMods != null;
   }
 }

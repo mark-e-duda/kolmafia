@@ -11,6 +11,7 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.TreeMap;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import net.sourceforge.kolmafia.VYKEACompanionData.VYKEACompanionType;
 import net.sourceforge.kolmafia.listener.PreferenceListenerRegistry;
@@ -392,6 +393,10 @@ public class Modifiers {
     if (modifier == null) return List.of();
 
     return this.doubles.getList(modifier);
+  }
+
+  public boolean hasDoubleModifier(Predicate<DoubleModifier> predicate) {
+    return this.doubles.anyMatch(predicate);
   }
 
   public int getRawBitmap(final BitmapModifier modifier) {
@@ -1210,29 +1215,79 @@ public class Modifiers {
       return;
     }
 
-    int weight = familiar.getUncappedWeight();
+    int weight = this.familiarWeight(familiar);
+    this.lookupFamiliarModifiers(familiar, weight, famItem);
+  }
 
+  private int familiarWeight(FamiliarData familiar) {
+    int weight = familiar.getUncappedWeight();
     if (KoLConstants.activeEffects.contains(FIDOXENE)) {
       weight = Math.max(weight, 20);
     }
-
     weight += (int) this.getDouble(DoubleModifier.FAMILIAR_WEIGHT);
     weight += (int) this.getDouble(DoubleModifier.HIDDEN_FAMILIAR_WEIGHT);
-    weight += (familiar.getFeasted() ? 10 : 0);
+    weight += familiar.getFeasted() ? 10 : 0;
     weight += familiar.getSoupWeight();
-    // Comma Chameleons gain a passive 5lbs while they are imitating another familiar
-    weight +=
-        (familiar.getId() == FamiliarPool.CHAMELEON && familiar.getId() != familiar.getEffectiveId()
-            ? 5
-            : 0);
-
+    if (familiar.getId() == FamiliarPool.CHAMELEON
+        && familiar.getId() != familiar.getEffectiveId()) {
+      weight += 5;
+    }
     double percent = this.getDouble(DoubleModifier.FAMILIAR_WEIGHT_PCT) / 100.0;
     if (percent != 0.0) {
       weight = (int) Math.floor(weight + weight * percent);
     }
+    return Math.max(1, weight);
+  }
 
-    weight = Math.max(1, weight);
-    this.lookupFamiliarModifiers(familiar, weight, famItem);
+  private double volleyballFactor(
+      FamiliarData familiar, FamiliarRaceData raceData, int weight, int cappedWeight) {
+    double effective = cappedWeight * this.getDouble(DoubleModifier.VOLLEYBALL_WEIGHT);
+    if (effective == 0.0 && raceData.isVolleyType()) {
+      effective = weight;
+    }
+    if (effective == 0.0) {
+      return 0.0;
+    }
+    double factor = this.getDouble(DoubleModifier.VOLLEYBALL_EFFECTIVENESS);
+    if (factor == 0.0 && familiar.getEffectiveId() != FamiliarPool.JACK_IN_THE_BOX) {
+      factor = 1.0;
+    }
+    return factor * (2 + effective / 5);
+  }
+
+  private double sombreroFactor(FamiliarRaceData raceData, int weight, int cappedWeight) {
+    double effective = cappedWeight * this.getDouble(DoubleModifier.SOMBRERO_WEIGHT);
+    if (effective == 0.0 && raceData.isSombreroType()) {
+      effective = weight;
+    }
+    effective += this.getDouble(DoubleModifier.SOMBRERO_BONUS);
+    if (effective == 0.0) {
+      return 0.0;
+    }
+    double factor = this.getDouble(DoubleModifier.SOMBRERO_EFFECTIVENESS);
+    if (factor == 0.0) {
+      factor = 1.0;
+    }
+    return Math.min(
+        Math.max(factor * (Modifiers.currentML / 4) * (0.1 + 0.005 * effective), 1), 230);
+  }
+
+  private static double familiarDropEffect(
+      FamiliarData familiar,
+      double effective,
+      double effectiveness,
+      double squareRootFactor,
+      double weightFactor,
+      boolean defaultEffectiveness) {
+    if (effective == 0.0) {
+      return 0.0;
+    }
+    if (effectiveness == 0.0
+        && (defaultEffectiveness || familiar.getId() != FamiliarPool.JACK_IN_THE_BOX)) {
+      effectiveness = 1.0;
+    }
+    return effectiveness
+        * (Math.sqrt(squareRootFactor * effective) + weightFactor * effective - 3 * weightFactor);
   }
 
   public void lookupFamiliarModifiers(
@@ -1261,15 +1316,8 @@ public class Modifiers {
     double volleyFactor = 0.0;
     double sombreroFactor = 0.0;
 
-    double effective = cappedWeight * this.getDouble(DoubleModifier.VOLLEYBALL_WEIGHT);
-    if (effective == 0.0 && raceData.isVolleyType()) {
-      effective = weight;
-    }
-    if (effective != 0.0) {
-      double factor = this.getDouble(DoubleModifier.VOLLEYBALL_EFFECTIVENESS);
-      // The 0->1 factor for generic familiars conflicts with the JitB
-      if (factor == 0.0 && familiarId != FamiliarPool.JACK_IN_THE_BOX) factor = 1.0;
-      factor = factor * (2 + effective / 5);
+    double factor = this.volleyballFactor(familiar, raceData, weight, cappedWeight);
+    if (factor != 0.0) {
       double tuning;
       if ((tuning = this.getDouble(DoubleModifier.FAMILIAR_TUNING_MUSCLE)) > 0) {
         double mainstatFactor = tuning / 100;
@@ -1330,21 +1378,7 @@ public class Modifiers {
       }
     }
 
-    effective = cappedWeight * this.getDouble(DoubleModifier.SOMBRERO_WEIGHT);
-    if (effective == 0.0 && raceData.isSombreroType()) {
-      effective = weight;
-    }
-    effective += this.getDouble(DoubleModifier.SOMBRERO_BONUS);
-    if (effective != 0.0) {
-      double factor = this.getDouble(DoubleModifier.SOMBRERO_EFFECTIVENESS);
-      if (factor == 0.0) factor = 1.0;
-      // currentML is always >= 4, so we don't need to check for negatives
-      int maxStats = 230;
-      sombreroFactor =
-          Math.min(
-              Math.max(factor * (Modifiers.currentML / 4) * (0.1 + 0.005 * effective), 1),
-              maxStats);
-    }
+    sombreroFactor = this.sombreroFactor(raceData, weight, cappedWeight);
 
     if (this.getBoolean(BooleanModifier.VOLLEYBALL_OR_SOMBRERO)) {
       if (volleyFactor > sombreroFactor) {
@@ -1361,16 +1395,15 @@ public class Modifiers {
       }
     }
 
-    effective = cappedWeight * this.getDouble(DoubleModifier.LEPRECHAUN_WEIGHT);
+    double effective = cappedWeight * this.getDouble(DoubleModifier.LEPRECHAUN_WEIGHT);
     if (effective == 0.0 && raceData.isMeatDropType()) {
       effective = weight;
     }
     if (effective != 0.0) {
-      double factor = this.getDouble(DoubleModifier.LEPRECHAUN_EFFECTIVENESS);
-      if (factor == 0.0) factor = 1.0;
+      double leprechaunFactor = this.getDouble(DoubleModifier.LEPRECHAUN_EFFECTIVENESS);
       this.addDouble(
           DoubleModifier.MEATDROP,
-          factor * (Math.sqrt(220 * effective) + 2 * effective - 6),
+          familiarDropEffect(familiar, effective, leprechaunFactor, 220.0, 2.0, true),
           ModifierType.FAMILIAR,
           race);
     }
@@ -1447,13 +1480,10 @@ public class Modifiers {
 
     if (effective == 0.0) return;
 
-    double factor = this.getDouble(effectivenessModifier);
-    // The 0->1 factor for generic familiars conflicts with the JitB
-    if (factor == 0.0 && familiar.getId() != FamiliarPool.JACK_IN_THE_BOX) factor = 1.0;
-
     this.addDouble(
         modifier,
-        factor * (Math.sqrt(55 * effective) + effective - 3),
+        familiarDropEffect(
+            familiar, effective, this.getDouble(effectivenessModifier), 55.0, 1.0, false),
         ModifierType.FAMILIAR,
         familiar.getRace());
   }

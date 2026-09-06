@@ -1853,6 +1853,30 @@ public class RuntimeLibraryTest extends AbstractCommandTestBase {
     }
 
     @Test
+    public void immediateMaximizationEquipsRepeatedAccessoriesInOrder() {
+      setupFakeClient();
+      var cleanups =
+          new Cleanups(
+              withEquipped(Slot.ACCESSORY1, "clownskin belt"),
+              withEquippableItem("clownskin belt", 2));
+
+      try (cleanups) {
+        execute("maximize(\"mp, -tie\", false)");
+      }
+
+      var equipRequests =
+          getRequests().stream()
+              .filter(request -> request.method().equals("POST"))
+              .map(request -> getPostRequestBody(request))
+              .filter(body -> body.contains("whichitem=2476"))
+              .toList();
+      assertEquals(2, equipRequests.size());
+      assertTrue(equipRequests.get(0).contains("slot=2"));
+      assertTrue(equipRequests.get(1).contains("slot=3"));
+      assertContinueState();
+    }
+
+    @Test
     public void itShouldRespectFilters() {
       String maxStr = "meat";
       HttpClientWrapper.setupFakeClient();

@@ -225,7 +225,7 @@ public class EquipmentManager {
 
     // Codpiece gems can also have other consumption types (e.g. accessories),
     // so check for ETERNITY_CODPIECE modifiers separately
-    if (EquipmentRequest.isCodpieceGem(itemId)) {
+    if (EquipmentDatabase.isCodpieceGem(itemId)) {
       for (Slot slot : SlotSet.CODPIECE_SLOTS) {
         AdventureResult current = EquipmentManager.getEquipment(slot);
         AdventureResult.addResultToList(EquipmentManager.equipmentLists.get(slot), item);
@@ -1132,7 +1132,7 @@ public class EquipmentManager {
 
     for (AdventureResult currentItem : KoLConstants.inventory) {
       int itemId = currentItem.getItemId();
-      if (EquipmentRequest.isCodpieceGem(itemId)) {
+      if (EquipmentDatabase.isCodpieceGem(itemId)) {
         temporary.add(currentItem);
       }
     }
@@ -1291,6 +1291,41 @@ public class EquipmentManager {
    */
   public static final boolean usingChefstaff() {
     return EquipmentDatabase.isChefStaff(EquipmentManager.getEquipment(Slot.WEAPON));
+  }
+
+  public static boolean canEquipChefstaff(final boolean wearingSpecialSauceGlove) {
+    return KoLCharacter.hasSkill(SkillPool.SPIRIT_OF_RIGATONI)
+        || KoLCharacter.isJarlsberg()
+        || (KoLCharacter.isSauceror() && wearingSpecialSauceGlove);
+  }
+
+  public static AdventureResult getBestPlumberTool(final int primeIndex) {
+    AdventureResult hammer = ItemPool.get(ItemPool.HAMMER);
+    boolean haveHammer = InventoryManager.hasItem(hammer);
+    AdventureResult heavyHammer = ItemPool.get(ItemPool.HEAVY_HAMMER);
+    boolean haveHeavyHammer = InventoryManager.hasItem(heavyHammer);
+    AdventureResult fireFlower = ItemPool.get(ItemPool.PLUMBER_FIRE_FLOWER);
+    boolean haveFireFlower = InventoryManager.hasItem(fireFlower);
+    AdventureResult bonfireFlower = ItemPool.get(ItemPool.BONFIRE_FLOWER);
+    boolean haveBonfireFlower = InventoryManager.hasItem(bonfireFlower);
+    AdventureResult workBoots = ItemPool.get(ItemPool.WORK_BOOTS);
+    boolean haveWorkBoots = InventoryManager.hasItem(workBoots);
+    AdventureResult fancyBoots = ItemPool.get(ItemPool.FANCY_BOOTS);
+    boolean haveFancyBoots = InventoryManager.hasItem(fancyBoots);
+
+    return switch (primeIndex) {
+      case 0 -> haveHeavyHammer ? heavyHammer : haveHammer ? hammer : null;
+      case 1 -> haveBonfireFlower ? bonfireFlower : haveFireFlower ? fireFlower : null;
+      case 2 -> haveFancyBoots ? fancyBoots : haveWorkBoots ? workBoots : null;
+      default ->
+          haveHeavyHammer
+              ? heavyHammer
+              : haveBonfireFlower
+                  ? bonfireFlower
+                  : haveFancyBoots
+                      ? fancyBoots
+                      : haveHammer ? hammer : haveFireFlower ? fireFlower : workBoots;
+    };
   }
 
   /**
