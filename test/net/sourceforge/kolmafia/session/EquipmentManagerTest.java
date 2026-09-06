@@ -7,7 +7,6 @@ import static internal.helpers.Networking.json;
 import static internal.helpers.Player.withClass;
 import static internal.helpers.Player.withEquipped;
 import static internal.helpers.Player.withFamiliar;
-import static internal.helpers.Player.withHardcore;
 import static internal.helpers.Player.withIntrinsicEffect;
 import static internal.helpers.Player.withItem;
 import static internal.helpers.Player.withPath;
