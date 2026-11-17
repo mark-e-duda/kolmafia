@@ -2,11 +2,13 @@ package net.sourceforge.kolmafia.maximizer;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import net.java.dev.spellcast.utilities.LockableListModel;
 import net.sourceforge.kolmafia.AdventureResult;
 import net.sourceforge.kolmafia.FamiliarData;
@@ -92,11 +94,418 @@ public class Maximizer {
   };
 
   static MaximizerSpeculation best;
-  static int bestChecked;
+  static long bestChecked;
   static long bestUpdate;
   static long combinationLimit;
+  private static final long FRONTIER_MEMORY_LIMIT = 64L * 1024L * 1024L;
+  private static final long FRONTIER_ENTRY_BYTES = 80L;
+  private static final long FRONTIER_CONTEXT_BYTES = 1024L;
+  private static SearchContext searchContext;
+
+  private record Incumbent(MaximizerSpeculation speculation, long searchOrder) {}
+
+  private record FrontierContext(
+      MaximizerSpeculation speculation,
+      List<FamiliarData> enthronedFamiliars,
+      SlotList<CheckedItem> possibles,
+      AdventureResult bestCard,
+      FamiliarData useCrownFamiliar) {}
+
+  private record FrontierEntry(
+      int contextIndex,
+      AdventureResult accessory1,
+      AdventureResult accessory2,
+      AdventureResult accessory3,
+      double upper,
+      long ordinal) {}
+
+  record SearchCertificate(
+      boolean frontierComplete,
+      boolean feasible,
+      boolean achieved,
+      double lower,
+      double upper,
+      double absoluteGap,
+      Double percentageGap) {}
+
+  record SearchStatus(
+      boolean frontierComplete, boolean feasible, double lower, double upper, boolean exact) {}
+
+  static final class FrontierCapacity {
+    private final long limit;
+
+    FrontierCapacity(long limit) {
+      if (limit < 0)
+        throw new IllegalArgumentException("frontier memory limit must be nonnegative");
+      this.limit = limit;
+    }
+
+    long retainedBytes(int contexts, int entries) {
+      return (long) contexts * FRONTIER_CONTEXT_BYTES + (long) entries * FRONTIER_ENTRY_BYTES;
+    }
+
+    void require(int contexts, int entries) {
+      long estimated = this.retainedBytes(contexts, entries);
+      if (estimated > this.limit) throw new MaximizerFrontierException(estimated);
+    }
+  }
+
+  private static final class SearchContext {
+    private Incumbent best;
+    private long checked;
+    private long nextSearchOrder;
+    private Long searchOrder;
+    private Integer frontierContext;
+    private final long combinationLimit;
+    private final long startedNanos;
+    private final long timeLimitNanos;
+    private final boolean budgetUsesOr;
+    private final FrontierCapacity frontierCapacity;
+    private final boolean certificateMode;
+    private final double certificatePoints;
+    private final double certificatePercent;
+    private final boolean certificateUsesOr;
+    private final List<FrontierContext> frontierContexts = new ArrayList<>();
+    private final List<FrontierEntry> frontier = new ArrayList<>();
+    private boolean collectingFrontier;
+    private boolean frontierComplete;
+    private double liveUpper = Double.POSITIVE_INFINITY;
+    private boolean certificateAchieved;
+    private long nextProgressUpdate;
+
+    private SearchContext(
+        MaximizerSpeculation best,
+        long startedNanos,
+        long combinationLimit,
+        long timeLimitSeconds,
+        boolean budgetUsesOr,
+        FrontierCapacity frontierCapacity,
+        boolean certificateMode,
+        double certificatePoints,
+        double certificatePercent,
+        boolean certificateUsesOr) {
+      this.best = new Incumbent(best, Long.MIN_VALUE);
+      this.combinationLimit = combinationLimit;
+      this.startedNanos = startedNanos;
+      this.timeLimitNanos =
+          timeLimitSeconds <= 0
+              ? 0
+              : TimeUnit.SECONDS.toNanos(
+                  Math.min(timeLimitSeconds, Long.MAX_VALUE / 1_000_000_000L));
+      this.budgetUsesOr = budgetUsesOr;
+      this.frontierCapacity = frontierCapacity;
+      this.certificateMode = certificateMode;
+      this.certificatePoints = certificatePoints;
+      this.certificatePercent = certificatePercent;
+      this.certificateUsesOr = certificateUsesOr;
+      this.nextProgressUpdate = System.currentTimeMillis() + 5000;
+    }
+  }
 
   private Maximizer() {}
+
+  static MaximizerSpeculation currentBest() {
+    return searchContext == null ? best : searchContext.best.speculation();
+  }
+
+  static void replaceBest(MaximizerSpeculation replacement) {
+    if (searchContext != null) {
+      searchContext.best = new Incumbent(replacement, Long.MIN_VALUE);
+    }
+    best = replacement;
+  }
+
+  static boolean considerBest(MaximizerSpeculation candidate) {
+    var context = searchContext;
+    if (context == null) {
+      if (candidate.compareTo(best) <= 0) return false;
+      best = candidate.clone();
+      return true;
+    }
+
+    Incumbent incumbent = context.best;
+    int comparison = candidate.compareTo(incumbent.speculation());
+    if (comparison < 0) return false;
+    long candidateOrder =
+        context.searchOrder == null ? context.nextSearchOrder++ : context.searchOrder;
+    if (comparison == 0 && candidateOrder >= incumbent.searchOrder()) return false;
+    context.best = new Incumbent(candidate.clone(), candidateOrder);
+    return true;
+  }
+
+  static long recordChecked() {
+    if (searchContext == null) return ++bestChecked;
+    return ++searchContext.checked;
+  }
+
+  static boolean shouldUpdateProgress(long now) {
+    var context = searchContext;
+    if (context == null) {
+      if (now <= bestUpdate) return false;
+      bestUpdate = now + 5000;
+      return true;
+    }
+    if (now <= context.nextProgressUpdate) return false;
+    context.nextProgressUpdate = now + 5000;
+    bestUpdate = context.nextProgressUpdate;
+    return true;
+  }
+
+  static long checkedCount() {
+    return searchContext == null ? bestChecked : searchContext.checked;
+  }
+
+  static boolean reachedSearchBudget(long checked) {
+    var context = searchContext;
+    if (context == null || context.certificateMode) return false;
+    boolean combinationEnabled = context.combinationLimit > 0;
+    boolean timeEnabled = context.timeLimitNanos > 0;
+    if (!combinationEnabled && !timeEnabled) return false;
+    boolean combinationReached = combinationEnabled && checked >= context.combinationLimit;
+    boolean timeReached =
+        timeEnabled && System.nanoTime() - context.startedNanos >= context.timeLimitNanos;
+    return budgetSatisfied(
+        combinationEnabled, combinationReached, timeEnabled, timeReached, context.budgetUsesOr);
+  }
+
+  static boolean budgetSatisfied(
+      boolean combinationEnabled,
+      boolean combinationReached,
+      boolean timeEnabled,
+      boolean timeReached,
+      boolean useOr) {
+    if (!combinationEnabled && !timeEnabled) return false;
+    return useOr
+        ? (combinationEnabled && combinationReached) || (timeEnabled && timeReached)
+        : (!combinationEnabled || combinationReached) && (!timeEnabled || timeReached);
+  }
+
+  static void checkSearchStop() throws MaximizerInterruptedException {
+    if (Thread.currentThread().isInterrupted() || !KoLmafia.permitsContinue()) {
+      throw new MaximizerInterruptedException();
+    }
+    if (reachedSearchBudget(checkedCount())) throw new MaximizerLimitException();
+  }
+
+  static void beginAccessoryFrontier() {
+    var context = searchContext;
+    if (context == null) return;
+    context.frontier.clear();
+    context.frontierContexts.clear();
+    context.frontierContext = null;
+    context.collectingFrontier = true;
+    context.frontierComplete = false;
+    context.liveUpper = Double.POSITIVE_INFINITY;
+  }
+
+  static boolean collectingAccessoryFrontier() {
+    return searchContext != null && searchContext.collectingFrontier;
+  }
+
+  static void enterAccessoryFrontierContext(
+      MaximizerSpeculation speculation,
+      List<FamiliarData> enthronedFamiliars,
+      SlotList<CheckedItem> possibles,
+      AdventureResult bestCard,
+      FamiliarData useCrownFamiliar) {
+    var context = searchContext;
+    if (context == null || !context.collectingFrontier) return;
+    requireFrontierCapacity(context, 1, 0);
+    int index = context.frontierContexts.size();
+    context.frontierContexts.add(
+        new FrontierContext(
+            speculation.clone(),
+            enthronedFamiliars,
+            new SlotList<>(possibles),
+            bestCard,
+            useCrownFamiliar));
+    context.frontierContext = index;
+  }
+
+  static void leaveAccessoryFrontierContext() {
+    if (searchContext != null) searchContext.frontierContext = null;
+  }
+
+  static void addAccessoryFrontierEntry(MaximizerSpeculation speculation, double upper) {
+    var context = searchContext;
+    if (context == null || !context.collectingFrontier) return;
+    if (context.frontierContext == null) {
+      throw new IllegalStateException("accessory frontier entry has no replay context");
+    }
+    requireFrontierCapacity(context, 0, 1);
+    context.frontier.add(
+        new FrontierEntry(
+            context.frontierContext,
+            speculation.equipment.get(Slot.ACCESSORY1),
+            speculation.equipment.get(Slot.ACCESSORY2),
+            speculation.equipment.get(Slot.ACCESSORY3),
+            upper,
+            context.frontier.size()));
+  }
+
+  private static void requireFrontierCapacity(
+      SearchContext context, int additionalContexts, int additionalEntries) {
+    context.frontierCapacity.require(
+        context.frontierContexts.size() + additionalContexts,
+        context.frontier.size() + additionalEntries);
+  }
+
+  static void finishAccessoryFrontier() throws MaximizerInterruptedException {
+    var context = searchContext;
+    if (context == null || !context.collectingFrontier) return;
+    context.collectingFrontier = false;
+    context.frontierComplete = true;
+    context.frontier.sort(
+        Comparator.comparingDouble(FrontierEntry::upper)
+            .reversed()
+            .thenComparingLong(FrontierEntry::ordinal));
+    for (int index = 0; index < context.frontier.size(); index++) {
+      FrontierEntry entry = context.frontier.get(index);
+      double queuedUpper =
+          index + 1 < context.frontier.size()
+              ? Math.max(entry.upper(), context.frontier.get(index + 1).upper())
+              : entry.upper();
+      context.liveUpper = queuedUpper;
+      if (context.certificateMode && certificateSatisfied(context, context.liveUpper)) {
+        context.certificateAchieved = true;
+        return;
+      }
+      checkSearchStop();
+      replayFrontierEntry(context, entry);
+      context.liveUpper =
+          index + 1 < context.frontier.size()
+              ? context.frontier.get(index + 1).upper()
+              : Double.NEGATIVE_INFINITY;
+    }
+    context.certificateAchieved = certificateSatisfied(context, context.liveUpper);
+  }
+
+  private static void replayFrontierEntry(SearchContext context, FrontierEntry entry)
+      throws MaximizerInterruptedException {
+    FrontierContext replay = context.frontierContexts.get(entry.contextIndex());
+    Long previousOrder = context.searchOrder;
+    context.searchOrder = entry.ordinal();
+    try {
+      replay
+          .speculation()
+          .clone()
+          .replayAccessoryFrontier(
+              entry.accessory1(),
+              entry.accessory2(),
+              entry.accessory3(),
+              replay.enthronedFamiliars(),
+              replay.possibles(),
+              replay.bestCard(),
+              replay.useCrownFamiliar());
+    } finally {
+      context.searchOrder = previousOrder;
+    }
+  }
+
+  private static boolean certificateSatisfied(SearchContext context, double upper) {
+    MaximizerSpeculation incumbent = context.best.speculation();
+    if (incumbent == null || incumbent.failed) return false;
+    double lower = incumbent.getScore();
+    if (incumbent.failed) return false;
+    return certificateSatisfied(
+        lower,
+        upper,
+        context.certificatePoints,
+        context.certificatePercent,
+        context.certificateUsesOr);
+  }
+
+  static boolean certificateSatisfied(
+      double lower, double upper, double points, double percent, boolean useOr) {
+    if (upper < lower) return true;
+    double gap = Math.max(0.0, upper - lower);
+    boolean pointEnabled = points > 0.0;
+    boolean percentEnabled = percent > 0.0 && lower > 0.0;
+    if (gap == 0.0) return false;
+    boolean pointSatisfied = pointEnabled && gap <= points;
+    boolean percentSatisfied = percentEnabled && gap <= lower * percent / 100.0;
+    if (!pointEnabled && !percentEnabled) return false;
+    if (useOr) return pointSatisfied || percentSatisfied;
+    if (points == 0.0 || percent == 0.0) return false;
+    if (lower <= 0.0) return pointSatisfied;
+    return pointSatisfied && percentSatisfied;
+  }
+
+  static SearchCertificate searchCertificate() {
+    var context = searchContext;
+    if (context == null) {
+      return new SearchCertificate(false, false, false, Double.NaN, Double.NaN, Double.NaN, null);
+    }
+    MaximizerSpeculation incumbent = context.best.speculation();
+    double lower = incumbent == null || incumbent.failed ? Double.NaN : incumbent.getScore();
+    boolean feasible = incumbent != null && !incumbent.failed;
+    if (!feasible) lower = Double.NaN;
+    double upper =
+        feasible && context.frontierComplete
+            ? Math.max(lower, context.liveUpper)
+            : context.liveUpper;
+    double gap = feasible && context.frontierComplete ? Math.max(0.0, upper - lower) : Double.NaN;
+    Double percentage = feasible && lower > 0.0 ? gap * 100.0 / lower : null;
+    return new SearchCertificate(
+        context.frontierComplete,
+        feasible,
+        context.certificateAchieved,
+        lower,
+        upper,
+        gap,
+        percentage);
+  }
+
+  static SearchStatus searchStatus() {
+    SearchCertificate certificate = searchCertificate();
+    return new SearchStatus(
+        certificate.frontierComplete(),
+        certificate.feasible(),
+        certificate.lower(),
+        certificate.upper(),
+        certificate.feasible()
+            && certificate.frontierComplete()
+            && certificate.upper() <= certificate.lower());
+  }
+
+  static String searchInterval(SearchStatus status) {
+    if (!status.frontierComplete()) {
+      return "; frontier construction incomplete, so no valid upper bound is available";
+    }
+    return "; unproven interval ["
+        + KoLConstants.FLOAT_FORMAT.format(status.lower())
+        + ", "
+        + (Double.isFinite(status.upper())
+            ? KoLConstants.FLOAT_FORMAT.format(status.upper())
+            : "infinity")
+        + "]";
+  }
+
+  static String certificateInterval(SearchCertificate certificate) {
+    if (!certificate.frontierComplete()) {
+      return "; frontier construction incomplete, so no valid proof interval is available";
+    }
+    StringBuilder message = new StringBuilder("; interval [");
+    message.append(KoLConstants.FLOAT_FORMAT.format(certificate.lower()));
+    message.append(", ");
+    message.append(KoLConstants.FLOAT_FORMAT.format(certificate.upper()));
+    message.append("], gap ");
+    message.append(KoLConstants.FLOAT_FORMAT.format(certificate.absoluteGap()));
+    if (certificate.percentageGap() == null) {
+      message.append(" points; relative percentage is undefined for a nonpositive result");
+    } else {
+      message.append(" points (");
+      message.append(KoLConstants.FLOAT_FORMAT.format(certificate.percentageGap()));
+      message.append("%)");
+    }
+    return message.toString();
+  }
+
+  private static void addSearchStatus(String message, boolean error) {
+    String text = "(" + message + ")";
+    if (error) text = "<font color=red>" + text + "</font>";
+    boosts.add(new Boost("", text, (AdventureResult) null, 0.0));
+  }
 
   public static boolean lastMaximizeSucceeded() {
     return best != null && best.scored && !best.failed;
@@ -108,6 +517,22 @@ public class Maximizer {
       PriceLevel priceLevel,
       EquipScope equipScope,
       Set<filterType> filter) {
+    return maximize(
+        maximizerString,
+        maxPrice,
+        priceLevel,
+        equipScope,
+        filter,
+        new FrontierCapacity(FRONTIER_MEMORY_LIMIT));
+  }
+
+  static boolean maximize(
+      String maximizerString,
+      int maxPrice,
+      PriceLevel priceLevel,
+      EquipScope equipScope,
+      Set<filterType> filter,
+      FrontierCapacity frontierCapacity) {
     MaximizerFrame.expressionSelect.setSelectedItem(maximizerString);
 
     // iECOC has to be turned off before actually maximizing as
@@ -116,7 +541,7 @@ public class Maximizer {
 
     KoLmafiaCLI.isExecutingCheckOnlyCommand = false;
 
-    Maximizer.maximize(equipScope, maxPrice, priceLevel, false, filter);
+    Maximizer.maximize(equipScope, maxPrice, priceLevel, false, filter, frontierCapacity);
 
     if (!KoLmafia.permitsContinue()) {
       return false;
@@ -142,6 +567,25 @@ public class Maximizer {
       PriceLevel priceLevel,
       boolean includeAll,
       Set<filterType> filter) {
+    maximize(
+        equipScope,
+        maxPrice,
+        priceLevel,
+        includeAll,
+        filter,
+        new FrontierCapacity(FRONTIER_MEMORY_LIMIT));
+  }
+
+  private static void maximize(
+      EquipScope equipScope,
+      int maxPrice,
+      PriceLevel priceLevel,
+      boolean includeAll,
+      Set<filterType> filter,
+      FrontierCapacity frontierCapacity) {
+    long searchStartedNanos = System.nanoTime();
+    Maximizer.searchContext = null;
+    Maximizer.bestChecked = 0;
     KoLmafia.forceContinue();
     String maxMe = (String) MaximizerFrame.expressionSelect.getSelectedItem();
     RequestLogger.printLine("Maximizer: " + maxMe);
@@ -190,6 +634,38 @@ public class Maximizer {
       Maximizer.bestChecked = 0;
       Maximizer.bestUpdate = System.currentTimeMillis() + 5000;
       Maximizer.combinationLimit = Preferences.getLong("maximizerCombinationLimit");
+      long timeLimitSeconds = Preferences.getLong("maximizerTimeLimitSeconds");
+      boolean certificateMode = Preferences.getBoolean("maximizerCertificateMode");
+      if (Maximizer.combinationLimit < 0 || timeLimitSeconds < 0) {
+        addSearchStatus("search budgets must be nonnegative values", true);
+        return;
+      }
+      double certificatePoints = 0.0;
+      double certificatePercent = 0.0;
+      if (certificateMode) {
+        certificatePoints = Preferences.getDouble("maximizerMaximumScoreDifferencePoints");
+        certificatePercent = Preferences.getDouble("maximizerMaximumScoreDifferencePercent");
+        if (!Double.isFinite(certificatePoints)
+            || certificatePoints < 0.0
+            || !Double.isFinite(certificatePercent)
+            || certificatePercent < 0.0) {
+          addSearchStatus("proof gaps must be finite, nonnegative values", true);
+          return;
+        }
+      }
+      Maximizer.searchContext =
+          new SearchContext(
+              Maximizer.best,
+              searchStartedNanos,
+              Maximizer.combinationLimit,
+              timeLimitSeconds,
+              Preferences.getBoolean("maximizerBudgetUsesOr"),
+              frontierCapacity,
+              certificateMode,
+              certificatePoints,
+              certificatePercent,
+              Preferences.getBoolean("maximizerScoreDifferenceOr"));
+      String stopMessage = null;
       try {
         Maximizer.eval.enumerateEquipment(equipScope, maxPrice, priceLevel);
       } catch (MaximizerExceededException e) {
@@ -197,25 +673,45 @@ public class Maximizer {
             new Boost(
                 "", "(maximum achieved, no further combinations checked)", Slot.NONE, null, 0.0));
       } catch (MaximizerLimitException e) {
-        Maximizer.boosts.add(
-            new Boost(
-                "",
-                "<font color=red>(hit combination limit, optimality not guaranteed)</font>",
-                Slot.NONE,
-                null,
-                0.0));
+        stopMessage = "search budget reached; optimality not proven";
       } catch (MaximizerInterruptedException e) {
         KoLmafia.forceContinue();
-        Maximizer.boosts.add(
-            new Boost(
-                "",
-                "<font color=red>(interrupted, optimality not guaranteed)</font>",
-                Slot.NONE,
-                null,
-                0.0));
+        stopMessage =
+            certificateMode
+                ? "interrupted; requested certification was not achieved"
+                : "interrupted; optimality not proven";
+      } catch (MaximizerFrontierException e) {
+        stopMessage =
+            "frontier memory guard refused an incomplete search at "
+                + KoLConstants.COMMA_FORMAT.format(e.estimatedBytes())
+                + " estimated bytes; optimality not proven";
+      } finally {
+        Maximizer.searchContext.collectingFrontier = false;
+        Maximizer.searchContext.frontierContext = null;
       }
-      if (!currentEquipment.failed && Maximizer.best.getScore() < currentEquipment.getScore()) {
-        Maximizer.best = currentEquipment;
+      Maximizer.best = Maximizer.currentBest();
+      Maximizer.bestChecked = Maximizer.checkedCount();
+      if (!currentEquipment.failed
+          && (Maximizer.best.failed || Maximizer.best.getScore() < currentEquipment.getScore())) {
+        Maximizer.replaceBest(currentEquipment);
+      }
+      SearchCertificate certificate = Maximizer.searchCertificate();
+      if (!certificate.feasible()) {
+        addSearchStatus("no feasible equipment result was found", true);
+      } else if (stopMessage != null) {
+        addSearchStatus(
+            stopMessage
+                + (certificateMode
+                    ? certificateInterval(certificate)
+                    : searchInterval(Maximizer.searchStatus())),
+            true);
+      } else if (certificateMode && certificate.achieved()) {
+        addSearchStatus(
+            (certificate.absoluteGap() == 0.0
+                    ? "proved exact optimum"
+                    : "proved requested optimum gap")
+                + certificateInterval(certificate),
+            false);
       }
       MaximizerSpeculation.showProgress();
 
@@ -1731,6 +2227,9 @@ public class Maximizer {
 
   private static EquipScope emitSlot(
       Slot slot, EquipScope equipScope, int maxPrice, PriceLevel priceLevel, double current) {
+    if (!Maximizer.eval.codpiece().isSearchable() && SlotSet.CODPIECE_SLOTS.contains(slot)) {
+      return equipScope;
+    }
     if (KoLCharacter.inHatTrick() && slot == Slot.HAT) {
       return equipScope;
     }
@@ -1831,13 +2330,30 @@ public class Maximizer {
       }
       text = text + " (";
 
-      CheckedItem checkedItem = new CheckedItem(itemId, equipScope, maxPrice, priceLevel);
+      boolean codpieceSlot =
+          Maximizer.eval.codpiece().isSearchable() && SlotSet.CODPIECE_SLOTS.contains(slot);
+      CheckedItem checkedItem =
+          codpieceSlot
+              ? new CheckedItem(
+                  itemId,
+                  equipScope,
+                  maxPrice,
+                  priceLevel,
+                  CodpieceMaximizer.maxUsefulGemCopies(itemId),
+                  true)
+              : new CheckedItem(itemId, equipScope, maxPrice, priceLevel);
+      boolean preserveCodpieceGem =
+          EquipmentRequest.isCodpieceGem(itemId)
+              && Maximizer.eval.codpiece().reservedCopiesInGemSlots(Maximizer.best.equipment, item)
+                  > 0;
 
       long price = 0L;
 
       // How many have been needed so far to make this maximization set?
       // We need 1 + that number to equip this item, not just 1
       int count = 0;
+      int consumed = 0;
+      int released = 0;
 
       // If we're running from command line then execute them straight away,
       // so we have to count how much we've used in 'earlier' items
@@ -1851,10 +2367,16 @@ public class Maximizer {
           }
         }
       } else {
-        // Otherwise we iterate through the maximization set so far
+        for (var piece : SlotSet.ALL_SLOTS) {
+          if (piece.ordinal() >= slot.ordinal()) break;
+          if (item.equals(Maximizer.best.equipment.get(piece))) count++;
+        }
+
         for (Boost boost : Maximizer.boosts) {
-          if (item.equals(boost.getItem())) {
-            count++;
+          if (codpieceSlot && releasesItem(boost, item)) {
+            released++;
+          } else if (item.equals(boost.getItem())) {
+            if (!boost.getCmd().isEmpty()) consumed++;
           }
         }
       }
@@ -1884,22 +2406,36 @@ public class Maximizer {
       } else if (checkedItem.initial > count) {
         // This may look odd, but we need an item, not a checked item
         // The count of a checked item includes creatable, buyable, pullable etc.
+        boolean keepFamiliarCopy =
+            codpieceSlot && item.equals(Maximizer.best.equipment.get(Slot.FAMILIAR));
         String method =
-            InventoryManager.simRetrieveItem(
-                ItemPool.get(item.getItemId(), count + 1),
-                equipScope == EquipScope.EQUIP_NOW,
-                false);
+            codpieceSlot && checkedItem.inventory + released > consumed
+                ? "have"
+                : codpieceSlot && equipScope != EquipScope.EQUIP_NOW
+                    ? InventoryManager.simRetrieveItemFromAccessibleSources(
+                        ItemPool.get(item.getItemId(), consumed + 1 - released), !keepFamiliarCopy)
+                    : InventoryManager.simRetrieveItem(
+                        ItemPool.get(item.getItemId(), count + 1),
+                        equipScope == EquipScope.EQUIP_NOW,
+                        false);
         if (!method.equals("have")) {
           text = method + " & " + text;
         }
-        cmd =
-            switch (method) {
-              case "uncloset" -> "closet take 1 \u00B6" + item.getItemId() + ";" + cmd;
-              case "unstash" -> "stash take 1 \u00B6" + item.getItemId() + ";" + cmd;
-              // Should be only hitting this after Ronin I think
-              case "pull" -> "pull 1 \u00B6" + item.getItemId() + ";" + cmd;
-              default -> cmd;
-            };
+        Slot movableCodpieceSlot = preserveCodpieceGem ? movableCodpieceSlot(item) : Slot.NONE;
+        if (movableCodpieceSlot != Slot.NONE) {
+          text = "unequip & " + text;
+          cmd = "unequip " + movableCodpieceSlot.name + ";" + cmd;
+        } else {
+          cmd =
+              switch (method) {
+                case "uncloset" -> "closet take 1 \u00B6" + item.getItemId() + ";" + cmd;
+                case "unstash" -> "stash take 1 \u00B6" + item.getItemId() + ";" + cmd;
+                case "pull" -> "pull 1 \u00B6" + item.getItemId() + ";" + cmd;
+                case "free pull" ->
+                    preserveCodpieceGem ? "pull 1 \u00B6" + item.getItemId() + ";" + cmd : cmd;
+                default -> cmd;
+              };
+        }
       } else if (checkedItem.creatable + checkedItem.initial > count) {
         text = "make & " + text;
         cmd = "make \u00B6" + item.getItemId() + ";" + cmd;
@@ -1948,6 +2484,9 @@ public class Maximizer {
         }
       } else { // Mall buyable
         text = "acquire & " + text;
+        if (preserveCodpieceGem) {
+          cmd = "buy 1 \u00B6" + itemId + ";" + cmd;
+        }
         if (priceLevel != PriceLevel.DONT_CHECK) {
           price = MallPriceManager.getMallPrice(itemId);
         }
@@ -1970,6 +2509,27 @@ public class Maximizer {
       Maximizer.boosts.add(boost);
     }
     return equipScope;
+  }
+
+  private static boolean releasesItem(Boost boost, AdventureResult item) {
+    Slot slot = boost.getSlot();
+    return slot != null
+        && slot != Slot.NONE
+        && EquipmentManager.getEquipment(slot).equals(item)
+        && !Objects.equals(Maximizer.best.equipment.get(slot), item);
+  }
+
+  private static Slot movableCodpieceSlot(AdventureResult item) {
+    for (Slot slot : SlotSet.CODPIECE_SLOTS) {
+      if (EquipmentManager.getEquipment(slot).equals(item)
+          && !Objects.equals(Maximizer.best.equipment.get(slot), item)
+          && Maximizer.boosts.stream()
+              .map(Boost::getCmd)
+              .noneMatch(command -> command.contains("unequip " + slot.name))) {
+        return slot;
+      }
+    }
+    return Slot.NONE;
   }
 
   private static boolean excludedTCRSItem(int itemId) {

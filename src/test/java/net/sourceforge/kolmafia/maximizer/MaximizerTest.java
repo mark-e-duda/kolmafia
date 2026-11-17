@@ -24,7 +24,9 @@ import static internal.helpers.Player.withItemInStash;
 import static internal.helpers.Player.withItemInStorage;
 import static internal.helpers.Player.withLocation;
 import static internal.helpers.Player.withMCD;
+import static internal.helpers.Player.withMallPrice;
 import static internal.helpers.Player.withMeat;
+import static internal.helpers.Player.withMeatInStorage;
 import static internal.helpers.Player.withMoxie;
 import static internal.helpers.Player.withMuscle;
 import static internal.helpers.Player.withNotAllowedInStandard;
@@ -47,6 +49,7 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.hasItems;
 import static org.hamcrest.Matchers.hasProperty;
 import static org.hamcrest.Matchers.hasToString;
 import static org.hamcrest.Matchers.is;
@@ -58,6 +61,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import internal.helpers.Cleanups;
 import java.time.Month;
+import java.util.List;
 import net.sourceforge.kolmafia.AscensionClass;
 import net.sourceforge.kolmafia.AscensionPath.Path;
 import net.sourceforge.kolmafia.KoLCharacter;
@@ -81,6 +85,7 @@ import net.sourceforge.kolmafia.objectpool.SkillPool;
 import net.sourceforge.kolmafia.persistence.AdventureDatabase;
 import net.sourceforge.kolmafia.persistence.AdventureDatabase.Environment;
 import net.sourceforge.kolmafia.persistence.FamiliarDatabase;
+import net.sourceforge.kolmafia.persistence.ItemDatabase;
 import net.sourceforge.kolmafia.preferences.Preferences;
 import net.sourceforge.kolmafia.session.ClanManager;
 import net.sourceforge.kolmafia.session.EquipmentManager;
@@ -100,7 +105,7 @@ public class MaximizerTest {
             withEquippableItem("bounty-hunting helmet"),
             withProperty("maximizerCombinationLimit", 1))) {
       maximize("item drop");
-      assertThat(Maximizer.bestChecked, is(1));
+      assertThat(Maximizer.bestChecked, is(1L));
       assertThat(Maximizer.combinationLimit, is(1L));
     }
 
@@ -263,6 +268,22 @@ public class MaximizerTest {
                     containsString("(maximum achieved, no further combinations checked)"))));
       }
     }
+
+    @Test
+    public void directModifierMaximumPreservesBestRecommendation() {
+      int helmetTurtle = ItemDatabase.getItemId("helmet turtle");
+      int bountyHelmet = ItemDatabase.getItemId("bounty-hunting helmet");
+      try (var cleanups =
+          new Cleanups(
+              withEquippableItem("helmet turtle"),
+              withEquippableItem("bounty-hunting helmet"),
+              withOverrideModifiers(ModifierType.ITEM, helmetTurtle, "Food Drop: 20"),
+              withOverrideModifiers(ModifierType.ITEM, bountyHelmet, "Food Drop: 10"))) {
+        assertTrue(maximize("food drop, 15 max, -tie"));
+
+        assertThat(getBoosts(), hasItem(recommendsSlot(Slot.HAT, "helmet turtle")));
+      }
+    }
   }
 
   @Nested
@@ -315,6 +336,27 @@ public class MaximizerTest {
       modifiers.setDouble(DoubleModifier.DAMAGE_ABSORPTION, 2.0);
       evaluator.getScore(modifiers);
       assertFalse(evaluator.failed);
+    }
+
+    @Test
+    public void directModifierMinimumUsesAvailableCopies() {
+      try (var cleanups =
+          new Cleanups(
+              withEquippableItem(ItemPool.WORTHLESS_TRINKET, 2),
+              withOverrideModifiers(
+                  ModifierType.ITEM, ItemPool.WORTHLESS_TRINKET, "Food Drop: 30"))) {
+        assertTrue(maximize("food drop 50 min, -tie"));
+
+        long recommendedCopies =
+            getBoosts().stream()
+                .filter(
+                    boost ->
+                        boost.getItem() != null
+                            && boost.getItem().getItemId() == ItemPool.WORTHLESS_TRINKET
+                            && SlotSet.ACCESSORY_SLOTS.contains(boost.getSlot()))
+                .count();
+        assertThat(recommendedCopies, is(2L));
+      }
     }
   }
 
@@ -412,6 +454,117 @@ public class MaximizerTest {
         assertTrue(maximize(maxStr));
         assertThat(getBoosts(), not(hasItem(recommendsSlot(Slot.WEAPON))));
       }
+    }
+  }
+
+  @Test
+  void signedDirectModifierPreservesBestRecommendation() {
+    try (var cleanups =
+        new Cleanups(
+            withEquippableItem(ItemPool.WORTHLESS_TRINKET, 2),
+            withEquippableItem(ItemPool.SEAL_TOOTH),
+            withOverrideModifiers(ModifierType.ITEM, ItemPool.WORTHLESS_TRINKET, "Food Drop: 30"),
+            withOverrideModifiers(ModifierType.ITEM, ItemPool.SEAL_TOOTH, "Food Drop: -20"))) {
+      assertTrue(maximize("-food drop, -tie"));
+
+      assertThat(getBoosts(), hasItem(recommendsSlot(Slot.ACCESSORY1, "seal tooth")));
+      assertThat(getBoosts(), not(hasItem(recommendsSlot(Slot.ACCESSORY2, "worthless trinket"))));
+      assertThat(getBoosts(), not(hasItem(recommendsSlot(Slot.ACCESSORY3, "worthless trinket"))));
+    }
+  }
+
+  @ParameterizedTest
+  @CsvSource(
+      delimiter = '|',
+      value = {
+        "hp, -tie | Maximum HP Percent: 100 | Maximum HP: 50 | helmet turtle",
+        "-muscle, -tie | Muscle: -20 | Muscle Percent: 100 | helmet turtle",
+        "muscle 150 min, -tie | Muscle: -20 | Muscle Percent: 100 | bounty-hunting helmet"
+      })
+  void transformedScoresPreserveBestRecommendation(
+      String expression, String firstModifiers, String secondModifiers, String expected) {
+    int alternative = ItemPool.get("bounty-hunting helmet").getItemId();
+    try (var cleanups =
+        new Cleanups(
+            withStats(100, 100, 100),
+            withOverrideModifiers(ModifierType.ITEM, ItemPool.HELMET_TURTLE, firstModifiers.trim()),
+            withOverrideModifiers(ModifierType.ITEM, alternative, secondModifiers.trim()),
+            withEquippableItem(ItemPool.HELMET_TURTLE),
+            withEquippableItem(alternative))) {
+      assertTrue(maximize(expression.trim()));
+
+      assertThat(getBoosts(), hasItem(recommendsSlot(Slot.HAT, expected.trim())));
+    }
+  }
+
+  @Test
+  void equalizedStatCanDetermineRecommendation() {
+    int alternative = ItemPool.get("bounty-hunting helmet").getItemId();
+    try (var cleanups =
+        new Cleanups(
+            withStats(10, 20, 30),
+            withOverrideModifiers(ModifierType.ITEM, ItemPool.HELMET_TURTLE, "Equalize: \"Moxie\""),
+            withOverrideModifiers(ModifierType.ITEM, alternative, "Muscle: 15"),
+            withEquippableItem(ItemPool.HELMET_TURTLE),
+            withEquippableItem(alternative))) {
+      assertTrue(maximize("muscle, -tie"));
+
+      assertThat(getBoosts(), hasItem(recommendsSlot(Slot.HAT, "helmet turtle")));
+    }
+  }
+
+  @Test
+  void alternateMpControllingStatCanDetermineRecommendation() {
+    int alternative = ItemPool.get("bounty-hunting helmet").getItemId();
+    try (var cleanups =
+        new Cleanups(
+            withStats(10, 20, 30),
+            withOverrideModifiers(ModifierType.ITEM, ItemPool.HELMET_TURTLE, "Moxie Controls MP"),
+            withOverrideModifiers(ModifierType.ITEM, alternative, "Maximum MP: 5"),
+            withEquippableItem(ItemPool.HELMET_TURTLE),
+            withEquippableItem(alternative))) {
+      assertTrue(maximize("mp, -tie"));
+
+      assertThat(getBoosts(), hasItem(recommendsSlot(Slot.HAT, "helmet turtle")));
+    }
+  }
+
+  @Test
+  void rawResistanceAboveImmunityWins() {
+    int alternative = ItemPool.get("bounty-hunting helmet").getItemId();
+    try (var cleanups =
+        new Cleanups(
+            withOverrideModifiers(ModifierType.ITEM, ItemPool.HELMET_TURTLE, "Hot Immunity"),
+            withOverrideModifiers(ModifierType.ITEM, alternative, "Hot Resistance: 150"),
+            withEquippableItem(ItemPool.HELMET_TURTLE),
+            withEquippableItem(alternative))) {
+      assertTrue(maximize("hot resistance, -tie"));
+
+      assertThat(getBoosts(), hasItem(recommendsSlot(Slot.HAT, "bounty-hunting helmet")));
+    }
+  }
+
+  @Test
+  void fixedAccessoryLeavesRemainingSlotsAvailable() {
+    try (var cleanups =
+        new Cleanups(
+            withOverrideModifiers(ModifierType.ITEM, ItemPool.WORTHLESS_TRINKET, "Food Drop: 30"),
+            withOverrideModifiers(ModifierType.ITEM, ItemPool.SEAL_TOOTH, "Food Drop: 20"),
+            withEquipped(Slot.ACCESSORY1, ItemPool.WORTHLESS_TRINKET),
+            withEquippableItem(ItemPool.SEAL_TOOTH, 2))) {
+      assertTrue(maximize("food drop, 200 max, -tie"));
+
+      assertThat(getBoosts(), hasItem(recommendsSlot(Slot.ACCESSORY2, "seal tooth")));
+      assertThat(getBoosts(), hasItem(recommendsSlot(Slot.ACCESSORY3, "seal tooth")));
+    }
+  }
+
+  @Test
+  void negativeStinkyCheeseWeightRejectsStinkyEquipment() {
+    try (var cleanups = new Cleanups(withEquippableItem(ItemPool.STINKY_CHEESE_SWORD))) {
+      assertTrue(maximize("-1 stinky cheese, -tie"));
+
+      assertThat(getBoosts(), not(hasItem(recommendsSlot(Slot.WEAPON, "stinky cheese sword"))));
     }
   }
 
@@ -3792,10 +3945,12 @@ public class MaximizerTest {
             withEquippableItem(alternative))) {
       assertTrue(maximize("item drop, -tie, current"));
       assertThat(getBoosts(), hasItem(recommendsSlot(Slot.HAT, "bounty-hunting helmet")));
-      int combinationsWithCurrent = Maximizer.bestChecked;
+      long combinationsWithCurrent = Maximizer.bestChecked;
 
       assertTrue(maximize("item drop, -tie, -current"));
       assertThat(getBoosts(), hasItem(recommendsSlot(Slot.HAT, "bounty-hunting helmet")));
+      assertThat(combinationsWithCurrent, greaterThan(1L));
+      assertThat(Maximizer.bestChecked, is(1L));
       assertThat(combinationsWithCurrent, greaterThan(Maximizer.bestChecked));
     }
   }
@@ -4073,6 +4228,71 @@ public class MaximizerTest {
   }
 
   @Test
+  void retainsEquipmentThatContributesAcrossMultipleMinimums() {
+    int itemDropHat = ItemPool.get("bounty-hunting helmet").getItemId();
+    int coldHat = ItemPool.HELMET_TURTLE;
+    int hotHat = ItemPool.DISCO_MASK;
+    int balancedHat = ItemPool.MINERS_HELMET;
+    int balancedShirt = ItemPool.get("ASCII shirt").getItemId();
+    try (var cleanups =
+        new Cleanups(
+            withProperty("maximizerConsiderMinModifiersInShortlist", true),
+            withSkill("Torso Awareness"),
+            withStats(300, 300, 300),
+            withOverrideModifiers(ModifierType.ITEM, itemDropHat, "Item Drop: +100"),
+            withOverrideModifiers(ModifierType.ITEM, coldHat, "Cold Resistance: +10"),
+            withOverrideModifiers(ModifierType.ITEM, hotHat, "Hot Resistance: +10"),
+            withOverrideModifiers(
+                ModifierType.ITEM, balancedHat, "Cold Resistance: +6, Hot Resistance: +6"),
+            withOverrideModifiers(
+                ModifierType.ITEM, balancedShirt, "Cold Resistance: +4, Hot Resistance: +4"),
+            withEquippableItem(itemDropHat),
+            withEquippableItem(coldHat),
+            withEquippableItem(hotHat),
+            withEquippableItem(balancedHat),
+            withEquippableItem(balancedShirt))) {
+      assertTrue(
+          maximize(
+              "0.01 cold resistance 10 min 10 max, 0.01 hot resistance 10 min 10 max, item drop, -tie"));
+      assertThat(getBoosts(), hasItem(recommendsSlot(Slot.HAT, "miner's helmet")));
+      assertThat(getBoosts(), hasItem(recommendsSlot(Slot.SHIRT, "ASCII shirt")));
+    }
+  }
+
+  @Test
+  void retainsEnoughAccessoriesToMeetAMinimum() {
+    var itemDropAccessories = List.of("polka-dot bow tie", "gold wedding ring", "adobe ascot");
+    var resistanceAccessories =
+        List.of("hardened slime belt", "incredibly dense meat gem", "Groll doll");
+    try (var cleanups =
+        new Cleanups(
+            withProperty("maximizerConsiderMinModifiersInShortlist", true),
+            withOverrideModifiers(ModifierType.ITEM, itemDropAccessories.get(0), "Item Drop: +100"),
+            withOverrideModifiers(ModifierType.ITEM, itemDropAccessories.get(1), "Item Drop: +90"),
+            withOverrideModifiers(ModifierType.ITEM, itemDropAccessories.get(2), "Item Drop: +80"),
+            withOverrideModifiers(
+                ModifierType.ITEM, resistanceAccessories.get(0), "Sleaze Resistance: +4"),
+            withOverrideModifiers(
+                ModifierType.ITEM, resistanceAccessories.get(1), "Sleaze Resistance: +3"),
+            withOverrideModifiers(
+                ModifierType.ITEM, resistanceAccessories.get(2), "Sleaze Resistance: +3"),
+            withEquippableItem(itemDropAccessories.get(0)),
+            withEquippableItem(itemDropAccessories.get(1)),
+            withEquippableItem(itemDropAccessories.get(2)),
+            withEquippableItem(resistanceAccessories.get(0)),
+            withEquippableItem(resistanceAccessories.get(1)),
+            withEquippableItem(resistanceAccessories.get(2)))) {
+      assertTrue(maximize("0.01 sleaze resistance 10 min 10 max, item drop, -tie"));
+      assertThat(
+          SlotSet.ACCESSORY_SLOTS.stream().map(Maximizer.best.equipment::get).toList(),
+          hasItems(
+              ItemPool.get(resistanceAccessories.get(0)),
+              ItemPool.get(resistanceAccessories.get(1)),
+              ItemPool.get(resistanceAccessories.get(2))));
+    }
+  }
+
+  @Test
   void negativeSwitchForSameFamiliarDoesNotCancelPositiveSwitch() {
     try (var cleanups = withFamiliarInTerrarium(FamiliarPool.BABY_GRAVY_FAIRY)) {
       assertTrue(maximize("switch Baby Gravy Fairy, -switch Baby Gravy Fairy, item drop"));
@@ -4244,6 +4464,120 @@ public class MaximizerTest {
 
       assertThat(getBoosts(), hasItem(hasProperty("cmd", startsWith("enthrone Galloping Grill"))));
       assertThat(getBoosts(), hasItem(hasProperty("cmd", startsWith("bjornify Rock Lobster"))));
+    }
+  }
+
+  @Test
+  void carriedFamiliarContextualInteractionSelectsExactResultWithoutPruning() {
+    try (var cleanups =
+        new Cleanups(
+            withFamiliar(FamiliarPool.BABY_GRAVY_FAIRY),
+            withEquippableItem("Crown of Thrones"),
+            withFamiliarInTerrarium(FamiliarPool.GALLOPING_GRILL),
+            withOverrideModifiers(
+                ModifierType.THRONE, "Galloping Grill", "Familiar Weight: +10"))) {
+      assertTrue(maximize("item drop, -tie"));
+
+      assertThat(Maximizer.best.equipment.get(Slot.HAT), equalTo(ItemPool.get("Crown of Thrones")));
+      assertThat(getBoosts(), hasItem(hasProperty("cmd", startsWith("enthrone Galloping Grill"))));
+    }
+  }
+
+  @Test
+  void cardContextualInteractionSelectsExactResultWithoutPruning() {
+    int card = ItemPool.get("Alice's Army Foil Lanceman").getItemId();
+    try (var cleanups =
+        new Cleanups(
+            withFamiliar(FamiliarPool.BABY_GRAVY_FAIRY),
+            withEquippableItem("card sleeve"),
+            withEquippableItem(card),
+            withOverrideModifiers(ModifierType.ITEM, card, "Familiar Weight: +10"))) {
+      assertTrue(maximize("item drop, -tie"));
+
+      assertThat(Maximizer.best.equipment.get(Slot.OFFHAND), equalTo(ItemPool.get("card sleeve")));
+      assertThat(Maximizer.best.equipment.get(Slot.CARDSLEEVE), equalTo(ItemPool.get(card)));
+      assertThat(Maximizer.bestChecked, greaterThan(1L));
+    }
+  }
+
+  @Test
+  void outfitContextualInteractionSelectsExactResultWithoutPruning() {
+    try (var cleanups =
+        new Cleanups(
+            withFamiliar(FamiliarPool.BABY_GRAVY_FAIRY),
+            withEquippableItem("beer helmet"),
+            withEquippableItem("distressed denim pants"),
+            withEquippableItem("bejeweled pledge pin"),
+            withOverrideModifiers(
+                ModifierType.OUTFIT,
+                "Frat Warrior Fatigues",
+                "Item Drop: +1, Fairy Effectiveness: +2"))) {
+      assertTrue(maximize("item drop, -tie"));
+
+      assertThat(Maximizer.best.equipment.get(Slot.HAT), equalTo(ItemPool.get("beer helmet")));
+      assertThat(
+          Maximizer.best.equipment.get(Slot.PANTS),
+          equalTo(ItemPool.get("distressed denim pants")));
+      assertThat(
+          SlotSet.ACCESSORY_SLOTS.stream().map(Maximizer.best.equipment::get).toList(),
+          hasItem(ItemPool.get("bejeweled pledge pin")));
+      assertThat(Maximizer.bestChecked, greaterThan(1L));
+    }
+  }
+
+  @Test
+  void synergyContextualInteractionSelectsExactResultWithoutPruning() {
+    try (var cleanups =
+        new Cleanups(
+            withRestricted(false),
+            withFamiliar(FamiliarPool.BABY_GRAVY_FAIRY),
+            withEquippableItem("bitter bowtie"),
+            withEquippableItem("brazen bracelet"),
+            withOverrideModifiers(
+                ModifierType.SYNERGY,
+                "bitter bowtie/brazen bracelet",
+                "Meat Drop: +100, Fairy Effectiveness: +2"))) {
+      assertTrue(maximize("meat drop, -tie"));
+
+      assertThat(
+          SlotSet.ACCESSORY_SLOTS.stream().map(Maximizer.best.equipment::get).toList(),
+          hasItems(ItemPool.get("bitter bowtie"), ItemPool.get("brazen bracelet")));
+      assertThat(Maximizer.bestChecked, greaterThan(1L));
+    }
+  }
+
+  @Test
+  void derivedObjectiveInteractionSelectsExactResultWithoutPruning() {
+    try (var cleanups =
+        new Cleanups(
+            withRestricted(false),
+            withClass(AscensionClass.SAUCEROR),
+            withStats(10, 10, 10),
+            withFamiliar(FamiliarPool.BABY_GRAVY_FAIRY),
+            withEquippableItem("bitter bowtie"),
+            withEquippableItem("brazen bracelet"),
+            withEquippableItem("astral shirt"),
+            withEquippableItem("makeshift garbage shirt"),
+            withSkill("Torso Awareness"),
+            withOverrideModifiers(
+                ModifierType.SYNERGY,
+                "bitter bowtie/brazen bracelet",
+                "Muscle: +100, Maximum HP: +100, Meat Drop: +100"),
+            withOverrideModifiers(
+                ModifierType.ITEM,
+                ItemPool.get("astral shirt").getItemId(),
+                "Maximum HP Percent: +1000"),
+            withOverrideModifiers(
+                ModifierType.ITEM,
+                ItemPool.get("makeshift garbage shirt").getItemId(),
+                "Maximum HP: +400"))) {
+      assertTrue(maximize("hp, meat drop, -tie"));
+
+      assertThat(
+          SlotSet.ACCESSORY_SLOTS.stream().map(Maximizer.best.equipment::get).toList(),
+          hasItems(ItemPool.get("bitter bowtie"), ItemPool.get("brazen bracelet")));
+      assertThat(Maximizer.best.equipment.get(Slot.SHIRT), equalTo(ItemPool.get("astral shirt")));
+      assertThat(Maximizer.bestChecked, greaterThan(1L));
     }
   }
 
@@ -4591,6 +4925,92 @@ public class MaximizerTest {
       assertThat(getBoosts(), hasItem(recommendsSlot(Slot.HAT, "bounty-hunting helmet")));
       assertThat(EquipmentManager.getEquipment(Slot.HAT), is(equipped));
     }
+  }
+
+  @Test
+  void mallRecommendationAcquiresCopiesForEveryAccessorySlot() {
+    int bowTie = ItemPool.get("polka-dot bow tie").getItemId();
+    try (var cleanups =
+        new Cleanups(
+            withOverrideModifiers(ModifierType.ITEM, bowTie, "Item Drop: +1000"),
+            withStats(10, 10, 10),
+            withItem(bowTie),
+            withProperty("autoSatisfyWithMall", true),
+            withInteractivity(true))) {
+      maximizeAny("item drop, -tie");
+
+      assertThat(
+          getBoosts(),
+          hasItems(
+              hasProperty("cmd", is("equip acc1 \u00B6" + bowTie)),
+              hasToString(startsWith("acquire & equip acc2 polka-dot bow tie")),
+              hasProperty("cmd", is("equip acc2 \u00B6" + bowTie)),
+              hasToString(startsWith("acquire & equip acc3 polka-dot bow tie")),
+              hasProperty("cmd", is("equip acc3 \u00B6" + bowTie))));
+    }
+  }
+
+  @Test
+  void mallRecommendationAcquiresOneCopyOfSingleEquipAccessory() {
+    try (var cleanups =
+        new Cleanups(
+            withOverrideModifiers(
+                ModifierType.ITEM,
+                ItemPool.get("polka-dot bow tie").getItemId(),
+                "Item Drop: +1000, Single Equip"),
+            withStats(10, 10, 10),
+            withProperty("autoSatisfyWithMall", true),
+            withInteractivity(true))) {
+      maximizeAny("item drop, -tie");
+
+      assertThat(
+          getBoosts(), hasItem(hasToString(startsWith("acquire & equip acc1 polka-dot bow tie"))));
+      assertThat(getBoosts(), not(hasItem(recommendsSlot(Slot.ACCESSORY2, "polka-dot bow tie"))));
+      assertThat(getBoosts(), not(hasItem(recommendsSlot(Slot.ACCESSORY3, "polka-dot bow tie"))));
+    }
+  }
+
+  @ParameterizedTest
+  @CsvSource({"1000, 1000, 3", "1000, 250, 2", "1000, 99, 0", "99, 1000, 0"})
+  void mallRecommendationsRespectPriceAndAvailableMeat(
+      int maxPrice, long meat, long expectedCopies) {
+    int bowTie = ItemPool.get("polka-dot bow tie").getItemId();
+    try (var cleanups =
+        new Cleanups(
+            withOverrideModifiers(ModifierType.ITEM, bowTie, "Item Drop: +1000"),
+            withStats(10, 10, 10),
+            withMallPrice(bowTie, 100),
+            withMeat(meat),
+            withProperty("autoSatisfyWithMall", true),
+            withInteractivity(true))) {
+      maximizeAny("item drop, -tie", maxPrice, PriceLevel.ALL);
+
+      assertThat(recommendedAccessorySlots(), is(expectedCopies));
+    }
+  }
+
+  @ParameterizedTest
+  @CsvSource({"1000, 3", "250, 2", "99, 0"})
+  void storageMallRecommendationsRespectAvailableMeat(long storageMeat, long expectedCopies) {
+    int bowTie = ItemPool.get("polka-dot bow tie").getItemId();
+    try (var cleanups =
+        new Cleanups(
+            withOverrideModifiers(ModifierType.ITEM, bowTie, "Item Drop: +1000"),
+            withStats(10, 10, 10),
+            withMallPrice(bowTie, 100),
+            withMeatInStorage(storageMeat),
+            withProperty("autoSatisfyWithMall", true),
+            withInteractivity(false))) {
+      maximizeAny("item drop, -tie", 1000, PriceLevel.ALL);
+
+      assertThat(recommendedAccessorySlots(), is(expectedCopies));
+    }
+  }
+
+  private static long recommendedAccessorySlots() {
+    return getBoosts().stream()
+        .filter(boost -> boost.getCmd() != null && boost.getCmd().startsWith("equip acc"))
+        .count();
   }
 
   @Test

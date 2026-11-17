@@ -1,6 +1,7 @@
 package net.sourceforge.kolmafia.swingui;
 
 import java.awt.BorderLayout;
+import java.awt.CardLayout;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.event.ActionEvent;
@@ -65,8 +66,13 @@ public class MaximizerFrame extends GenericFrame implements ListSelectionListene
     MRUListComboBoxes.updateJComboData(KoLConstants.maximizerMList, expressionSelect);
   }
 
-  private SmartButtonGroup equipmentSelect, mallSelect;
-  private AutoHighlightTextField maxPriceField;
+  private SmartButtonGroup equipmentSelect, mallSelect, budgetSelect, scoreDifferenceSelect;
+  private AutoHighlightTextField maxPriceField,
+      searchTimeField,
+      combinationLimitField,
+      scoreDifferencePercentField,
+      scoreDifferencePointsField;
+  private JCheckBox certificateModeCheckBox;
   private final ShowDescriptionList<Boost> boostList;
   private final EnumSet<filterType> activeFilters;
   private EnumMap<KoLConstants.filterType, JCheckBox> filterButtons;
@@ -154,6 +160,8 @@ public class MaximizerFrame extends GenericFrame implements ListSelectionListene
   }
 
   public void maximize() {
+    if (!this.saveSearchSettings()) return;
+
     Maximizer.maximize(
         EquipScope.byIndex(this.equipmentSelect.getSelectedIndex()),
         InputFieldUtilities.getValue(this.maxPriceField),
@@ -162,6 +170,50 @@ public class MaximizerFrame extends GenericFrame implements ListSelectionListene
         this.activeFilters);
 
     this.valueChanged(null);
+  }
+
+  private boolean saveSearchSettings() {
+    long seconds;
+    long combinations;
+    try {
+      seconds = Long.parseLong(this.searchTimeField.getText().trim());
+      combinations = Long.parseLong(this.combinationLimitField.getText().trim());
+      if (seconds < 0 || combinations < 0) throw new NumberFormatException();
+    } catch (NumberFormatException e) {
+      InputFieldUtilities.alert("Search budgets must be nonnegative whole numbers.");
+      return false;
+    }
+
+    boolean certificateMode = this.certificateModeCheckBox.isSelected();
+    double percent = 0.0;
+    double points = 0.0;
+    if (certificateMode) {
+      try {
+        percent = Double.parseDouble(this.scoreDifferencePercentField.getText().trim());
+        points = Double.parseDouble(this.scoreDifferencePointsField.getText().trim());
+        if (!Double.isFinite(percent)
+            || percent < 0.0
+            || !Double.isFinite(points)
+            || points < 0.0) {
+          throw new NumberFormatException();
+        }
+      } catch (NumberFormatException e) {
+        InputFieldUtilities.alert("Proof gaps must be finite, nonnegative numbers.");
+        return false;
+      }
+    }
+
+    Preferences.setLong("maximizerTimeLimitSeconds", seconds);
+    Preferences.setLong("maximizerCombinationLimit", combinations);
+    Preferences.setBoolean("maximizerBudgetUsesOr", this.budgetSelect.getSelectedIndex() == 1);
+    Preferences.setBoolean("maximizerCertificateMode", certificateMode);
+    if (certificateMode) {
+      Preferences.setDouble("maximizerMaximumScoreDifferencePercent", percent);
+      Preferences.setDouble("maximizerMaximumScoreDifferencePoints", points);
+      Preferences.setBoolean(
+          "maximizerScoreDifferenceOr", this.scoreDifferenceSelect.getSelectedIndex() == 1);
+    }
+    return true;
   }
 
   private class MaximizerPanel extends GenericPanel implements ItemListener, ActionListener {
@@ -202,6 +254,65 @@ public class MaximizerFrame extends GenericFrame implements ListSelectionListene
       MaximizerFrame.this.mallSelect.add(new JRadioButton("all consumables"));
       MaximizerFrame.this.mallSelect.setSelectedIndex(
           Preferences.getInteger("maximizerPriceLevel"));
+
+      JPanel searchModePanel = new JPanel(new FlowLayout(FlowLayout.LEADING, 0, 0));
+      MaximizerFrame.this.certificateModeCheckBox =
+          new JCheckBox(
+              "Prove the requested gap or exact optimum",
+              Preferences.getBoolean("maximizerCertificateMode"));
+      searchModePanel.add(MaximizerFrame.this.certificateModeCheckBox);
+
+      JPanel budgetPanel = new JPanel(new FlowLayout(FlowLayout.LEADING, 0, 0));
+      budgetPanel.add(new JLabel("Limit: "));
+      MaximizerFrame.this.searchTimeField =
+          new AutoHighlightTextField(Preferences.getString("maximizerTimeLimitSeconds"));
+      JComponentUtilities.setComponentSize(MaximizerFrame.this.searchTimeField, 55, -1);
+      budgetPanel.add(MaximizerFrame.this.searchTimeField);
+      budgetPanel.add(new JLabel(" seconds "));
+      MaximizerFrame.this.budgetSelect = new SmartButtonGroup(budgetPanel);
+      MaximizerFrame.this.budgetSelect.add(new JRadioButton("and"));
+      MaximizerFrame.this.budgetSelect.add(new JRadioButton("or"));
+      MaximizerFrame.this.budgetSelect.setSelectedIndex(
+          Preferences.getBoolean("maximizerBudgetUsesOr") ? 1 : 0);
+      MaximizerFrame.this.combinationLimitField =
+          new AutoHighlightTextField(Preferences.getString("maximizerCombinationLimit"));
+      JComponentUtilities.setComponentSize(MaximizerFrame.this.combinationLimitField, 80, -1);
+      budgetPanel.add(MaximizerFrame.this.combinationLimitField);
+      budgetPanel.add(new JLabel(" combinations"));
+      budgetPanel.add(new JLabel(" (0 disables a budget)."));
+
+      JPanel scoreDifferencePanel = new JPanel(new FlowLayout(FlowLayout.LEADING, 0, 0));
+      scoreDifferencePanel.add(new JLabel("Proof target: optimum within "));
+      MaximizerFrame.this.scoreDifferencePercentField =
+          new AutoHighlightTextField(
+              Preferences.getString("maximizerMaximumScoreDifferencePercent"));
+      JComponentUtilities.setComponentSize(MaximizerFrame.this.scoreDifferencePercentField, 50, -1);
+      scoreDifferencePanel.add(MaximizerFrame.this.scoreDifferencePercentField);
+      scoreDifferencePanel.add(new JLabel("% "));
+      MaximizerFrame.this.scoreDifferenceSelect = new SmartButtonGroup(scoreDifferencePanel);
+      MaximizerFrame.this.scoreDifferenceSelect.add(new JRadioButton("and"));
+      MaximizerFrame.this.scoreDifferenceSelect.add(new JRadioButton("or"));
+      MaximizerFrame.this.scoreDifferenceSelect.setSelectedIndex(
+          Preferences.getBoolean("maximizerScoreDifferenceOr") ? 1 : 0);
+      MaximizerFrame.this.scoreDifferencePointsField =
+          new AutoHighlightTextField(
+              Preferences.getString("maximizerMaximumScoreDifferencePoints"));
+      JComponentUtilities.setComponentSize(MaximizerFrame.this.scoreDifferencePointsField, 50, -1);
+      scoreDifferencePanel.add(MaximizerFrame.this.scoreDifferencePointsField);
+      scoreDifferencePanel.add(new JLabel(" points"));
+
+      JPanel searchSettingsPanel = new JPanel(new CardLayout());
+      searchSettingsPanel.add(budgetPanel, "limits");
+      searchSettingsPanel.add(scoreDifferencePanel, "targets");
+      CardLayout searchSettingsLayout = (CardLayout) searchSettingsPanel.getLayout();
+      MaximizerFrame.this.certificateModeCheckBox.addItemListener(
+          e ->
+              searchSettingsLayout.show(
+                  searchSettingsPanel,
+                  e.getStateChange() == ItemEvent.SELECTED ? "targets" : "limits"));
+      searchSettingsLayout.show(
+          searchSettingsPanel,
+          MaximizerFrame.this.certificateModeCheckBox.isSelected() ? "targets" : "limits");
 
       KoLConstants.filterType[] TopRowFilters =
           new KoLConstants.filterType[] {
@@ -268,13 +379,15 @@ public class MaximizerFrame extends GenericFrame implements ListSelectionListene
       filterPanelTopRow.add(filterCheckboxTopPanel, BorderLayout.CENTER);
       filterPanelBottomRow.add(filterCheckboxBottomPanel, BorderLayout.CENTER);
 
-      VerifiableElement[] elements = new VerifiableElement[5];
+      VerifiableElement[] elements = new VerifiableElement[7];
       elements[0] = new VerifiableElement("Maximize: ", MaximizerFrame.expressionSelect);
       elements[1] = new VerifiableElement("Equipment: ", equipPanel);
       elements[2] = new VerifiableElement("Max price: ", mallPanel);
-      elements[3] = new VerifiableElement("Filters: ", filterPanelTopRow);
-      elements[4] = new VerifiableElement(filterPanelBottomRow);
-      elements[3]
+      elements[3] = new VerifiableElement(searchModePanel);
+      elements[4] = new VerifiableElement(searchSettingsPanel);
+      elements[5] = new VerifiableElement("Filters: ", filterPanelTopRow);
+      elements[6] = new VerifiableElement(filterPanelBottomRow);
+      elements[5]
           .getLabel()
           .setToolTipText(
               "Other options available under menu General -> Preferences, tab General - Maximizer.");
